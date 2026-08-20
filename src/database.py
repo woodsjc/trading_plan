@@ -87,10 +87,6 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-# ----------------------------------------------------------------------------
-# Connection helper
-# ----------------------------------------------------------------------------
-
 
 def connect(db_path: Path) -> sqlite3.Connection:
     """
@@ -104,11 +100,6 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     init_db(conn)
     return conn
-
-
-# ----------------------------------------------------------------------------
-# Snapshot writes (underlying_metrics / options_contracts)
-# ----------------------------------------------------------------------------
 
 
 def save_underlying_rows(
@@ -142,11 +133,6 @@ def save_option_contracts(
     conn.commit()
 
 
-# ----------------------------------------------------------------------------
-# Snapshot reads (used by evaluate_symbol)
-# ----------------------------------------------------------------------------
-
-
 def load_underlying_metrics(conn: sqlite3.Connection, symbol: str) -> pd.DataFrame:
     return pd.read_sql_query(
         "SELECT * FROM underlying_metrics WHERE symbol = ?",
@@ -161,11 +147,6 @@ def load_options_contracts(conn: sqlite3.Connection, symbol: str) -> pd.DataFram
         conn,
         params=(symbol,),
     )
-
-
-# ----------------------------------------------------------------------------
-# iv_history (accrued, never dropped) — real historical-IV-based IV Rank
-# ----------------------------------------------------------------------------
 
 
 def load_iv30_history(db_path: Path) -> Dict[str, "pd.Series"]:

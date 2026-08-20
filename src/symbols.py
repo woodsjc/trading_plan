@@ -7,9 +7,9 @@ import pandas as pd
 def load_symbols(cfg: Dict[str, Any]) -> List[str]:
     symbols = cfg.get("symbols") or []
 
-    universe_file = cfg.get("universe_file")
-    if not symbols and universe_file and Path(universe_file).exists():
-        df = pd.read_csv(universe_file)
+    symbols_file = cfg.get("symbols_file")
+    if not symbols and symbols_file and Path(symbols_file).exists():
+        df = pd.read_csv(symbols_file)
         col = "symbol" if "symbol" in df.columns else df.columns[0]
         symbols = df[col].dropna().astype(str).tolist()
 
