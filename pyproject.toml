@@ -4,6 +4,8 @@ version = "0.0.1"
 description = "Evidence-first, VRP-aware covered options screening pipeline"
 readme = "README.md"
 requires-python = ">=3.14"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 
 dependencies = [
     "yfinance~=1.6.0",
