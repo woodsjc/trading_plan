@@ -1,6 +1,6 @@
+*.csv
 *.egg-info
 .venv
 __pycache__
 options_info.db
 reports
-symbols.csv
