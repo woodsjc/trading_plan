@@ -1,14 +1,14 @@
 import logging
 import os
-from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from datetime import date
+from typing import Any
 
 import requests
 
 from parsing import parse_date
 
 
-def get_fred_rate(cfg: Dict[str, Any]) -> Dict[str, Any]:
+def get_fred_rate(cfg: dict[str, Any]) -> dict[str, Any]:
     """
     Fetch risk-free rate from FRED.
 

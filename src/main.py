@@ -2,7 +2,7 @@ import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import pandas as pd
 
@@ -70,8 +70,8 @@ def main():
         config.get("min_iv_history_days", 100),
     )
 
-    underlying_rows: List[Dict[str, Any]] = []
-    contract_frames: List[pd.DataFrame] = []
+    underlying_rows: list[dict[str, Any]] = []
+    contract_frames: list[pd.DataFrame] = []
 
     max_workers = int(config.get("max_workers", 4))
 
@@ -149,7 +149,7 @@ def main():
 
     upsert_iv_history(conn, underlying_rows)
 
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
 
     for symbol in symbols:
         try:

@@ -1,18 +1,13 @@
-import importlib.util
 import logging
 import math
-import os
 import sqlite3
-import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
 
 from database import load_options_contracts, load_underlying_metrics
@@ -37,7 +32,7 @@ def call_with_backoff(
     DATA INCOMPLETE) on the first hiccup.
     """
     attempt = 0
-    last_exc: Optional[Exception] = None
+    last_exc: Exception | None = None
 
     while attempt <= max_retries:
         try:
@@ -78,7 +73,7 @@ def bs_delta(
     rf: float,
     iv: float,
     option_type: str,
-) -> Optional[float]:
+) -> float | None:
     """
     Black-Scholes delta approximation.
 
@@ -109,17 +104,17 @@ def bs_delta(
 
 
 def fetch_price_history(
-    symbols: List[str],
+    symbols: list[str],
     period: str = "1y",
     max_retries: int = 3,
     retry_backoff_seconds: float = 1.0,
-) -> Dict[str, Dict[str, Any]]:
+) -> dict[str, dict[str, Any]]:
     """
     Batch-download price history for all symbols.
 
     This is the part that efficiently handles ~100 symbols at once.
     """
-    out: Dict[str, Dict[str, Any]] = {
+    out: dict[str, dict[str, Any]] = {
         sym: {
             "last_price": None,
             "rv20": None,
@@ -158,7 +153,7 @@ def fetch_price_history(
 
     for sym in symbols:
         try:
-            close: Optional[pd.Series] = None
+            close: pd.Series | None = None
 
             if isinstance(data.columns, pd.MultiIndex):
                 level0 = data.columns.get_level_values(0)
@@ -216,8 +211,8 @@ def fetch_price_history(
 # ----------------------------------------------------------------------------
 
 
-def get_earnings_date(tk: yf.Ticker, info: Dict[str, Any]) -> Optional[date]:
-    candidates: List[date] = []
+def get_earnings_date(tk: yf.Ticker, info: dict[str, Any]) -> date | None:
+    candidates: list[date] = []
 
     for key in [
         "earningsTimestamp",
@@ -276,10 +271,10 @@ def get_earnings_date(tk: yf.Ticker, info: Dict[str, Any]) -> Optional[date]:
 
 def get_next_dividend_amount(
     tk: yf.Ticker,
-    info: Dict[str, Any],
+    info: dict[str, Any],
     max_retries: int = 3,
     retry_backoff_seconds: float = 1.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Estimate the amount of the *next single* dividend payment.
 
@@ -337,10 +332,10 @@ def fetch_fundamentals(
     symbol: str,
     max_retries: int = 3,
     retry_backoff_seconds: float = 1.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     tk = yf.Ticker(symbol)
 
-    info: Dict[str, Any] = {}
+    info: dict[str, Any] = {}
     try:
         info = call_with_backoff(
             lambda: tk.info or {},
@@ -388,11 +383,11 @@ def fetch_fundamentals(
 
 def fetch_options_chain(
     symbol: str,
-    spot: Optional[float],
-    rf_rate: Optional[float],
-    cfg: Dict[str, Any],
+    spot: float | None,
+    rf_rate: float | None,
+    cfg: dict[str, Any],
 ) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
 
     if spot is None or spot <= 0:
         return pd.DataFrame(rows)
@@ -432,8 +427,8 @@ def fetch_options_chain(
     # units bug; if only a handful of far-OTM contracts are >3.0 while the
     # bulk of the chain is normally scaled, those individual prints are
     # left alone and are far more likely to be genuine.
-    raw_rows: List[Dict[str, Any]] = []
-    raw_ivs: List[float] = []
+    raw_rows: list[dict[str, Any]] = []
+    raw_ivs: list[float] = []
 
     for exp in expirations:
         try:
@@ -540,7 +535,7 @@ def fetch_options_chain(
             rescale_threshold,
         )
 
-    t_years_cache: Dict[int, float] = {}
+    t_years_cache: dict[int, float] = {}
 
     for row in raw_rows:
         iv = row.pop("iv_raw")
@@ -574,7 +569,7 @@ def fetch_options_chain(
     return pd.DataFrame(rows)
 
 
-def compute_iv30(options_df: pd.DataFrame, spot: Optional[float]) -> Optional[float]:
+def compute_iv30(options_df: pd.DataFrame, spot: float | None) -> float | None:
     """
     Estimate IV30 from nearest 30-day expiration ATM options.
 
@@ -601,7 +596,7 @@ def compute_iv30(options_df: pd.DataFrame, spot: Optional[float]) -> Optional[fl
         return None
 
 
-def load_iv_rank_overrides(path: str) -> Dict[str, Optional[float]]:
+def load_iv_rank_overrides(path: str) -> dict[str, float | None]:
     if not path:
         return {}
 
@@ -614,7 +609,7 @@ def load_iv_rank_overrides(path: str) -> Dict[str, Optional[float]]:
         if "symbol" not in df.columns or "iv_rank" not in df.columns:
             return {}
 
-        out: Dict[str, Optional[float]] = {}
+        out: dict[str, float | None] = {}
         for _, row in df.iterrows():
             sym = str(row["symbol"]).strip().upper()
             out[sym] = safe_float(row["iv_rank"])
@@ -627,12 +622,12 @@ def load_iv_rank_overrides(path: str) -> Dict[str, Optional[float]]:
 
 def get_iv_rank(
     symbol: str,
-    iv30: Optional[float],
-    rv30_series: Optional[pd.Series],
-    overrides: Dict[str, Optional[float]],
-    cfg: Dict[str, Any],
-    iv30_history: Optional[pd.Series] = None,
-) -> Dict[str, Any]:
+    iv30: float | None,
+    rv30_series: pd.Series | None,
+    overrides: dict[str, float | None],
+    cfg: dict[str, Any],
+    iv30_history: pd.Series | None = None,
+) -> dict[str, Any]:
     """
     IV Rank hierarchy:
 
@@ -724,7 +719,7 @@ def get_iv_rank(
 # ----------------------------------------------------------------------------
 
 
-def empty_underlying(symbol: str, notes: str, rf_meta: Dict[str, Any]) -> Dict[str, Any]:
+def empty_underlying(symbol: str, notes: str, rf_meta: dict[str, Any]) -> dict[str, Any]:
     now_iso = datetime.now().isoformat()
 
     return {
@@ -756,12 +751,12 @@ def empty_underlying(symbol: str, notes: str, rf_meta: Dict[str, Any]) -> Dict[s
 
 def process_symbol(
     symbol: str,
-    cfg: Dict[str, Any],
-    history: Dict[str, Dict[str, Any]],
-    overrides: Dict[str, Optional[float]],
-    rf_meta: Dict[str, Any],
-    iv30_history_map: Optional[Dict[str, pd.Series]] = None,
-) -> Dict[str, Any]:
+    cfg: dict[str, Any],
+    history: dict[str, dict[str, Any]],
+    overrides: dict[str, float | None],
+    rf_meta: dict[str, Any],
+    iv30_history_map: dict[str, pd.Series] | None = None,
+) -> dict[str, Any]:
     try:
         max_retries = int(cfg.get("max_retries", 3))
         retry_backoff_seconds = float(cfg.get("retry_backoff_seconds", 1.0))
@@ -851,7 +846,7 @@ def process_symbol(
 # ----------------------------------------------------------------------------
 
 
-def base_result(symbol: str) -> Dict[str, Any]:
+def base_result(symbol: str) -> dict[str, Any]:
     return {
         "symbol": symbol,
         "decision_label": "⚪ DATA INCOMPLETE — DO NOT AUTHORIZE",
@@ -878,19 +873,19 @@ def base_result(symbol: str) -> Dict[str, Any]:
 
 def evaluate_symbol(
     symbol: str,
-    cfg: Dict[str, Any],
+    cfg: dict[str, Any],
     conn: sqlite3.Connection,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     result = base_result(symbol)
-    warnings: List[str] = []
+    warnings: list[str] = []
     planning_only = False
 
-    def reject(msg: str) -> Dict[str, Any]:
+    def reject(msg: str) -> dict[str, Any]:
         result["decision_label"] = "🔴 REJECT"
         result["reasons"].append(msg)
         return result
 
-    def incomplete(msg: str) -> Dict[str, Any]:
+    def incomplete(msg: str) -> dict[str, Any]:
         result["decision_label"] = "⚪ DATA INCOMPLETE — DO NOT AUTHORIZE"
         result["reasons"].append(msg)
         return result
@@ -954,7 +949,7 @@ def evaluate_symbol(
 
     if bool(u.get("div_amount_estimated")):
         warnings.append(
-            "Dividend amount is estimated (annual_rate/4 fallback) rather than a " "verified last-actual-payment figure"
+            "Dividend amount is estimated (annual_rate/4 fallback) rather than a verified last-actual-payment figure"
         )
 
     max_data_age_hours = safe_float(cfg.get("max_data_age_hours", 24)) or 24.0
@@ -965,7 +960,7 @@ def evaluate_symbol(
         age_hours = (datetime.now() - last_updated_dt).total_seconds() / 3600.0
 
         if age_hours > max_data_age_hours:
-            msg = f"Stage 0: data is {age_hours:.1f}h old, exceeds " f"max_data_age_hours={max_data_age_hours}"
+            msg = f"Stage 0: data is {age_hours:.1f}h old, exceeds max_data_age_hours={max_data_age_hours}"
             if strict_evidence:
                 return incomplete(msg)
 
@@ -1111,10 +1106,10 @@ def evaluate_symbol(
     if portfolio_value is not None and max_position_pct is not None:
         max_position_capital = portfolio_value * max_position_pct / 100.0
 
-    candidates: List[Dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
 
     for _, c in valid.iterrows():
-        candidate_warnings: List[str] = []
+        candidate_warnings: list[str] = []
 
         option_type = str(c.get("type", "")).upper().strip()
         strike = safe_float(c.get("strike"))
@@ -1321,7 +1316,7 @@ def evaluate_symbol(
 # portfolio-level sanity check, per Stage 32 of the rulebook.
 
 
-def evaluate_portfolio_stress(results: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
+def evaluate_portfolio_stress(results: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]:
     portfolio = cfg.get("portfolio", {}) or {}
 
     benchmark = portfolio.get("benchmark", "SPY")
@@ -1343,7 +1338,7 @@ def evaluate_portfolio_stress(results: List[Dict[str, Any]], cfg: Dict[str, Any]
     # to |delta| * 100 shares, weighted by the underlying's beta relative
     # to the benchmark. This is a rough aggregate, not a live Greeks feed.
     total_beta_weighted_delta_shares = 0.0
-    exposures: List[Dict[str, Any]] = []
+    exposures: list[dict[str, Any]] = []
 
     for r in authorized:
         delta = safe_float(r.get("delta"))
@@ -1378,7 +1373,7 @@ def evaluate_portfolio_stress(results: List[Dict[str, Any]], cfg: Dict[str, Any]
         approx_loss = total_beta_weighted_delta_shares * (shock_frac / 100.0)
         stress_results[f"{benchmark} {shock_pct:+g}%"] = round(approx_loss, 2)
 
-    regime_flags: List[str] = []
+    regime_flags: list[str] = []
     regime_state = "normal"
 
     if current_drawdown_pct >= regime_severe_drawdown:
@@ -1431,10 +1426,10 @@ def evaluate_portfolio_stress(results: List[Dict[str, Any]], cfg: Dict[str, Any]
 
 
 def write_report(
-    results: List[Dict[str, Any]],
-    cfg: Dict[str, Any],
-    portfolio_stress: Optional[Dict[str, Any]] = None,
-    batch_stats: Optional[Dict[str, Any]] = None,
+    results: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    portfolio_stress: dict[str, Any] | None = None,
+    batch_stats: dict[str, Any] | None = None,
 ) -> None:
     report_dir = Path(cfg.get("report_dir", "reports"))
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -1449,7 +1444,7 @@ def write_report(
     df.to_csv(csv_path, index=False)
 
     # Markdown
-    lines: List[str] = []
+    lines: list[str] = []
     lines.append("# Options Trading Plan v3.5 — Actionable Report")
     lines.append("")
     lines.append(f"Generated: {datetime.now().isoformat()}")

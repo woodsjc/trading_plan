@@ -1,10 +1,10 @@
-from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime
+from typing import Any
 
 import pandas as pd
 
 
-def safe_float(x: Any) -> Optional[float]:
+def safe_float(x: Any) -> float | None:
     try:
         if x is None:
             return None
@@ -20,7 +20,7 @@ def safe_float(x: Any) -> Optional[float]:
         return None
 
 
-def parse_date(value: Any) -> Optional[date]:
+def parse_date(value: Any) -> date | None:
     try:
         if value is None:
             return None
