@@ -8,7 +8,7 @@ CONFIG = {
     "max_workers": 4,
     "history_period": "1y",
     "min_dte_fetch": 30,
-    "max_dte_fetch": 40,
+    "max_dte_fetch": 45,
     # Delay (seconds) inserted between yfinance calls for a given symbol, and
     # used as the base for exponential backoff on failure. Helps avoid
     # tripping Yahoo's unofficial rate limits across a ~100-symbol batch.

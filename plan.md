@@ -1,10 +1,10 @@
-# plan.md: Data Collection & Pipeline Architecture for Options Trading Plan v3.3
+# plan.md: Data Collection & Pipeline Architecture for Options Trading Plan v3.5
 
 ## 1. The Data Source Reality Check
 **Is there a single datasource like Yahoo Finance that has *everything* already available?**
-**No.** There is no single free or low-cost retail API that provides every data point required by v3.3 out-of-the-box. 
+**No.** There is no single free or low-cost retail API that provides every data point required by v3.5 out-of-the-box.
 
-*   **Yahoo Finance (`yfinance`)** is excellent for underlying fundamentals, current prices, dividends, earnings dates, and current options chains (Bid/Ask, IV, OI, Volume). 
+*   **Yahoo Finance (`yfinance`)** is excellent for underlying fundamentals, current prices, dividends, earnings dates, and current options chains (Bid/Ask, IV, OI, Volume).
 *   **However, Yahoo Finance DOES NOT provide:** Historical Implied Volatility (required to calculate IV Rank/Percentile), historical realized volatility (requires raw price history), Dealer Gamma Exposure (GEX), or volatility term structures.
 
 **The Solution:** You must use a **hybrid data approach**. You will use Yahoo Finance for live underlying/contract data, and a specialized historical options data provider (like **Polygon.io**, **CBOE DataShop**, or **Orats**) to calculate the advanced volatility metrics (IV Rank, VRP, Term Structure).
@@ -40,9 +40,9 @@ To collect data for 100 symbols without hitting rate limits or timing out, use a
 
 ---
 
-## 4. Mapping v3.3 Stages to the Data Pipeline
+## 4. Mapping v3.5 Stages to the Data Pipeline
 
-Here is exactly how the collected data satisfies the hard gates of the v3.3 plan.
+Here is exactly how the collected data satisfies the hard gates of the v3.5 plan.
 
 ### Stage 0: Data Completeness Gate (Hard Gate)
 *Implementation:* Before running any trade logic, the Python script queries the database for the symbol. If any of the following are `NULL` or older than 24 hours, flag as `⚪ DATA INCOMPLETE`.
@@ -58,6 +58,9 @@ Here is exactly how the collected data satisfies the hard gates of the v3.3 plan
     *   `IV_Rank >= 30` (Hard Gate).
     *   `VRP_Ratio = IV30 / RV_30D`. If `VRP_Ratio < 1.05`, trigger `🔴 REJECT`.
     *   Check multi-horizon: Ensure both `IV30 > RV_20D` and `IV30 > RV_30D`.
+*   **IV Rank formula (corrected):** `IV_Rank = (IV30_today - min(IV30_history)) / (max(IV30_history) - min(IV30_history)) * 100`, computed over the accrued `iv_history` window once at least `min_iv_history_days` daily observations exist.
+    *   An earlier version of this pipeline computed `mean(IV30_history < IV30_today) * 100` here — that is **IV Percentile** (the fraction of historical days IV was lower than today), not IV Rank. Percentile and Rank are related but numerically distinct measures and can diverge sharply, e.g. when most historical days cluster at one end of the range but a single outlier sets a far-away min or max: percentile can read ~99 while true rank reads ~25 for the same series. Because most retail brokerages label their volatility gauge "IV Rank" using the min/max formula, code and displayed dashboards should use that formula, not the percentile formula, to be comparable to what a brokerage shows. If a percentile-style measure is ever wanted again, it must be stored/labeled as `iv_percentile`, never as `iv_rank`.
+    *   Until `min_iv_history_days` daily IV30 observations have accrued, the pipeline falls back to an **IV vs. realized-volatility proxy** (`estimated_rv_proxy`), which answers a different question ("is IV expensive vs. recent realized moves") than either IV Rank or IV Percentile ("is IV expensive vs. its own history"). This fallback is always marked `estimated=True` and forces the symbol to `🟡 WAIT` (planning-only) rather than `🟢 AUTHORIZED`.
 
 ### Stage 3: Catalyst Screen
 *   **Data Used:** Earnings Date, Ex-Dividend Date.
@@ -70,10 +73,11 @@ Here is exactly how the collected data satisfies the hard gates of the v3.3 plan
     *   Filter for `Open_Interest >= 250` (Hard Gate).
     *   Filter for `Daily_Volume >= 10` (Hard Gate).
     *   Calculate `Spread = Ask - Bid`. If `Spread / Midpoint > 0.10`, trigger `🔴 REJECT` (Hard Gate).
+*   **IV normalization (corrected):** Yahoo occasionally returns IV in whole-percent form (e.g. `35.0` instead of `0.35`) for a given chain. The rescale decision (`÷100`) is made **once per symbol, at the chain level**, based on whether a majority (default 50%, configurable via `iv_rescale_majority_frac`) of that chain's valid non-null IV prints exceed `iv_rescale_threshold` (default `3.0`). A prior per-contract version rescaled any single contract with `iv > 3.0` in isolation — but a legitimately high-IV deep-OTM, small-cap, or event-driven contract can print IV > 300% for real, and the per-contract heuristic would silently corrupt that single strike's IV (and everything downstream: delta, extrinsic value, IV30, VRP) while leaving the rest of the chain untouched. Deciding at the chain level avoids punishing genuine outliers while still catching systemic units bugs. Every chain-level rescale is logged at INFO with the affected/total IV counts for audit.
 
 ### Stage 6: Premium Sufficiency
 *   **Data Used:** Midpoint premium, Bid/Ask spread.
-*   **Logic:** 
+*   **Logic:**
     *   `Est_Cost = 2 * (Spread / 2)` (assuming half-spread slippage).
     *   `Net_Premium = Midpoint - Est_Cost`.
     *   If `Net_Premium / Est_Cost < 5`, trigger `🔴 REJECT`.
@@ -84,16 +88,19 @@ Here is exactly how the collected data satisfies the hard gates of the v3.3 plan
 
 ### Stage 9: Dividend / Assignment Risk
 *   **Data Used:** Extrinsic Value, Upcoming Dividend.
-*   **Logic:** 
+*   **Logic:**
     *   `Extrinsic = Call_Price - max(0, Stock_Price - Strike)`.
     *   If `Extrinsic < Dividend_Amount` AND `Ex_Div_Date < Expiration`, flag high assignment risk.
+*   **Dividend amount source (corrected):** `Dividend_Amount` must be the amount of the **single upcoming payment**, matching the v3.5 Stage 31 worked example (`extrinsic $1.00 < dividend $1.25`). An earlier version populated this from `info["dividendRate"]` / `trailingAnnualDividendRate` — both **annualized** figures (roughly 4x a single quarterly payment) — which overstates the relevant dividend and can misfire the Stage 9/31 check in either direction. The corrected source order is:
+    1. The most recent actual per-share payment from `ticker.dividends` (real historical payout — the best available proxy for the next one absent a specifically announced amount). Stored with `div_amount_source = "last_actual_payment"`, `div_amount_estimated = False`.
+    2. Fallback only if dividend history is unavailable: `annual_rate / 4` (assumes quarterly payment frequency). Stored with `div_amount_source = "annual_rate_div_4_estimate"`, `div_amount_estimated = True`, and surfaced as a warning on any resulting candidate so it isn't silently trusted as precise.
 
 ---
 
 ## 5. Database Schema Design (For 100 Symbols)
 
 **Table: `underlying_metrics` (Updated Daily/Pre-market)**
-| Column | Type | v3.3 Stage |
+| Column | Type | v3.5 Stage |
 | :--- | :--- | :--- |
 | `symbol` | VARCHAR (PK) | All |
 | `last_updated` | TIMESTAMP | Stage 0 |
@@ -102,9 +109,12 @@ Here is exactly how the collected data satisfies the hard gates of the v3.3 plan
 | `market_cap` | BIGINT | Stage 1 |
 | `earnings_date` | DATE | Stage 3 |
 | `ex_div_date` | DATE | Stage 9 |
-| `div_amount` | FLOAT | Stage 9 |
+| `div_amount` | FLOAT | Stage 9 — **single-payment estimate**, not annualized (see Stage 9 above) |
+| `div_amount_source` | VARCHAR | Stage 9 — `last_actual_payment` / `annual_rate_div_4_estimate` / `missing` |
+| `div_amount_estimated` | BOOLEAN | Stage 9 — flags the coarser fallback |
 | `iv30` | FLOAT | Stage 2 |
-| `iv_rank` | FLOAT | Stage 2 |
+| `iv_rank` | FLOAT | Stage 2 — **true min/max IV Rank** (or the labeled RV-proxy fallback; see Stage 2 above), not IV Percentile |
+| `iv_rank_source` | VARCHAR | Stage 2 — `manual_override` / `historical_iv_rank` / `estimated_rv_proxy` / `missing` |
 | `rv_20d` | FLOAT | Stage 2 |
 | `rv_30d` | FLOAT | Stage 2 |
 | `vrp_pp` | FLOAT | Stage 2 |
@@ -114,7 +124,7 @@ Here is exactly how the collected data satisfies the hard gates of the v3.3 plan
 > **Collection scope:** Only fetch/store expirations in the **30–40 DTE** window. Expirations outside this range should be skipped at fetch time (not just filtered later), to reduce API calls and keep the table lean for a ~100-symbol universe.
 
 **Table: `options_contracts` (Updated Daily/Pre-market)**
-| Column | Type | v3.3 Stage |
+| Column | Type | v3.5 Stage |
 | :--- | :--- | :--- |
 | `contract_id` | VARCHAR (PK) | Stage 4 |
 | `symbol` | VARCHAR (FK) | Stage 4 |
@@ -125,8 +135,8 @@ Here is exactly how the collected data satisfies the hard gates of the v3.3 plan
 | `bid` | FLOAT | Stage 5 |
 | `ask` | FLOAT | Stage 5 |
 | `midpoint` | FLOAT | Stage 6 |
-| `delta` | FLOAT | Stage 4 |
-| `iv` | FLOAT | Stage 4 |
+| `delta` | FLOAT | Stage 4 — model-derived (Black-Scholes from quoted IV); expect divergence from a broker's live Greeks feed, especially for dividend payers, since this model has no dividend-yield adjustment |
+| `iv` | FLOAT | Stage 4 — chain-level-rescale-corrected (see Stage 4/5 above) |
 | `open_interest` | INT | Stage 5 |
 | `volume` | INT | Stage 5 |
 | `extrinsic_value`| FLOAT | Stage 9 |
@@ -135,7 +145,7 @@ Here is exactly how the collected data satisfies the hard gates of the v3.3 plan
 
 ## 6. Execution & "Do Nothing" Logic
 
-The Python script should output a daily "Actionable Report" using the exact v3.3 Decision Labels.
+The Python script should output a daily "Actionable Report" using the exact v3.5 Decision Labels.
 
 ```python
 def run_v3_plan(symbol):
@@ -182,6 +192,18 @@ def run_v3_plan(symbol):
 
     Do not rely solely on Yahoo Finance. It will cause your script to fail the VRP and IV Rank hard gates.
     Subscribe to a historical options data feed (Polygon.io is the most cost-effective for Python) to calculate IV Rank and Term Structure.
-    Implement strict NULL checking. v3.3 explicitly states: If a required input cannot be verified: DATA INCOMPLETE — DO NOT AUTHORIZE.
-    Use a local database (DuckDB/SQLite). Querying 100 symbols via API calls every time you want to run the plan will be too slow and hit rate limits. Download the data once a day, store it locally, and run the v3.3 logic against the local DB.
+    Implement strict NULL checking. v3.5 explicitly states: If a required input cannot be verified: DATA INCOMPLETE — DO NOT AUTHORIZE.
+    Use a local database (DuckDB/SQLite). Querying 100 symbols via API calls every time you want to run the plan will be too slow and hit rate limits. Download the data once a day, store it locally, and run the v3.5 logic against the local DB.
     Calculate Realized Volatility correctly. Use log returns and annualize by multiplying by sqrt(252), not sqrt(365).
+    **Do not conflate IV Rank and IV Percentile.** Use the min/max formula for any field named `iv_rank`; if a percentile-style measure is wanted, name and document it separately as `iv_percentile`.
+    **Use a single-payment dividend amount, not an annualized rate**, for the Stage 9/31 extrinsic-vs-dividend assignment-risk check.
+    **Decide IV rescaling (`÷100`) at the chain level, not per-contract**, so genuinely high-IV individual contracts aren't silently corrupted.
+
+## 8. Known Fixes Log
+
+| Date | Issue | Fix |
+| :--- | :--- | :--- |
+| (this review) | `parsing.safe_float` used Python-2-only `except TypeError, ValueError:` syntax, which is a `SyntaxError` under Python 3 (confirmed against `pyproject.toml`'s `requires-python = ">=3.14"`) and prevents the module — and therefore the whole pipeline — from importing at all. | Changed to `except (TypeError, ValueError):`. |
+| (this review) | Dividend amount used for Stage 9/31 assignment-risk was sourced from `dividendRate`/`trailingAnnualDividendRate` (annualized), overstating the relevant single-payment dividend by roughly the payment frequency (~4x for quarterly payers). | Added `get_next_dividend_amount()`, preferring the last actual payment from `ticker.dividends`, falling back to `annual_rate / 4` only when history is unavailable, with source/estimated flags stored and surfaced as a candidate warning. |
+| (this review) | `get_iv_rank()` computed `mean(history < iv_today) * 100`, which is IV **Percentile**, not IV **Rank** — despite being stored in a field named `iv_rank` and gated against IV-Rank-style thresholds. Can diverge sharply from a brokerage's displayed IV Rank. | Changed the historical-IV branch to the standard min/max IV Rank formula: `(iv_today - hist.min()) / (hist.max() - hist.min()) * 100`. |
+| (this review) | `fetch_options_chain()` rescaled any individual contract's IV (`÷100`) whenever it read `> 3.0`, which can silently corrupt legitimately high-IV deep-OTM/small-cap/event-driven contracts. | Rescale decision now made once per symbol at the chain level, based on whether a majority of that chain's valid IV prints exceed the threshold. |

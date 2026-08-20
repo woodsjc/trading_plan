@@ -36,6 +36,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             earnings_date TEXT,
             ex_div_date TEXT,
             div_amount REAL,
+            div_amount_source TEXT,
+            div_amount_estimated INTEGER,
             iv30 REAL,
             iv_rank REAL,
             iv_rank_source TEXT,

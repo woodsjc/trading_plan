@@ -83,7 +83,10 @@ def bs_delta(
     Black-Scholes delta approximation.
 
     Yahoo Finance does not provide Greeks by default.
-    This is a model-based estimate from quoted IV.
+    This is a model-based estimate from quoted IV. It has no dividend-yield
+    adjustment and does not account for American-style early exercise, so
+    it will diverge from a broker's live Greeks feed, especially for
+    dividend payers or short-dated ITM contracts.
     """
     try:
         if spot <= 0 or strike <= 0 or t_years <= 0 or iv <= 0:
@@ -271,6 +274,65 @@ def get_earnings_date(tk: yf.Ticker, info: Dict[str, Any]) -> Optional[date]:
     return min(future) if future else None
 
 
+def get_next_dividend_amount(
+    tk: yf.Ticker,
+    info: Dict[str, Any],
+    max_retries: int = 3,
+    retry_backoff_seconds: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Estimate the amount of the *next single* dividend payment.
+
+    Stage 9/31 of the rulebook compares a contract's remaining extrinsic
+    value against "the upcoming dividend" — i.e. one payment, not an
+    annualized figure. `info["dividendRate"]` / `trailingAnnualDividendRate`
+    are annualized (sum of the trailing four payments for a typical
+    quarterly payer), so using them directly overstates the relevant
+    dividend by roughly the payment frequency and can trigger or miss the
+    Stage 31 assignment-risk check incorrectly.
+
+    Preferred source: the most recent actual per-share payment from
+    tk.dividends (a real historical payout, best proxy for the next one
+    absent a specific announced amount). Falls back to
+    annual_rate / payment_frequency (assumed quarterly, i.e. /4) only if
+    dividend history isn't available, and flags that fallback so callers
+    can treat it as lower-confidence.
+    """
+    try:
+        history = call_with_backoff(
+            lambda: tk.dividends,
+            max_retries=max_retries,
+            base_delay=retry_backoff_seconds,
+            label="tk.dividends",
+        )
+        if history is not None and not history.empty:
+            last_payment = safe_float(history.iloc[-1])
+            if last_payment is not None and last_payment > 0:
+                return {
+                    "amount": last_payment,
+                    "source": "last_actual_payment",
+                    "estimated": False,
+                }
+    except Exception as exc:
+        logging.warning("tk.dividends failed: %s", exc)
+
+    annual_rate = safe_float(info.get("dividendRate")) or safe_float(info.get("trailingAnnualDividendRate"))
+    if annual_rate is not None and annual_rate > 0:
+        # Quarterly is the dominant US payment frequency; this is a
+        # coarse fallback, not a verified per-payment amount.
+        return {
+            "amount": annual_rate / 4.0,
+            "source": "annual_rate_div_4_estimate",
+            "estimated": True,
+        }
+
+    return {
+        "amount": None,
+        "source": "missing",
+        "estimated": True,
+    }
+
+
 def fetch_fundamentals(
     symbol: str,
     max_retries: int = 3,
@@ -296,7 +358,12 @@ def fetch_fundamentals(
     market_cap = info.get("marketCap")
     beta = info.get("beta")
 
-    dividend_amount = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
+    dividend_data = get_next_dividend_amount(
+        tk,
+        info,
+        max_retries=max_retries,
+        retry_backoff_seconds=retry_backoff_seconds,
+    )
 
     ex_div_date = parse_date(info.get("exDividendDate"))
     earnings_date = get_earnings_date(tk, info)
@@ -306,7 +373,9 @@ def fetch_fundamentals(
         "average_volume": safe_float(avg_volume),
         "market_cap": safe_float(market_cap),
         "beta": safe_float(beta),
-        "dividend_amount": safe_float(dividend_amount),
+        "dividend_amount": dividend_data["amount"],
+        "dividend_amount_source": dividend_data["source"],
+        "dividend_amount_estimated": dividend_data["estimated"],
         "ex_div_date": ex_div_date,
         "earnings_date": earnings_date,
     }
@@ -353,7 +422,18 @@ def fetch_options_chain(
     max_dte_fetch = int(cfg.get("max_dte_fetch", 40))
     rf_for_delta = rf_rate if rf_rate is not None else 0.0
     now_iso = datetime.now().isoformat()
-    iv_rescale_count = 0
+
+    # Raw rows are collected first and the IV-rescale decision is made once
+    # per symbol (see below) rather than per-contract. A per-contract
+    # "iv > 3.0 -> /100" heuristic can silently corrupt legitimately
+    # high-IV contracts (deep OTM / small-cap / event-driven names can
+    # print IV > 300% for real). Deciding at the symbol/chain level is a
+    # much stronger signal: if the whole chain is off by ~100x it's a
+    # units bug; if only a handful of far-OTM contracts are >3.0 while the
+    # bulk of the chain is normally scaled, those individual prints are
+    # left alone and are far more likely to be genuine.
+    raw_rows: List[Dict[str, Any]] = []
+    raw_ivs: List[float] = []
 
     for exp in expirations:
         try:
@@ -405,45 +485,14 @@ def fetch_options_chain(
                 open_interest = safe_float(r.get("openInterest")) or 0.0
 
                 iv = safe_float(r.get("impliedVolatility"))
-                if iv is not None and iv > 3.0:
-                    # Yahoo should usually report IV as decimal, e.g. 0.35.
-                    # If a feed reports 35.0, normalize to 0.35.
-                    #
-                    # CAUTION: this heuristic can misfire on genuinely
-                    # high-IV contracts (deep OTM / small-cap / event-driven
-                    # names can legitimately show IV > 300%). Log every
-                    # rescale so it can be audited rather than applied
-                    # silently.
-                    logging.info(
-                        "IV rescale applied: %s %s %s strike=%s raw_iv=%.3f -> %.4f",
-                        symbol,
-                        exp_date.isoformat(),
-                        option_type,
-                        strike,
-                        iv,
-                        iv / 100.0,
-                    )
-                    iv = iv / 100.0
-                    iv_rescale_count += 1
-
-                if iv is not None and iv <= 0:
-                    iv = None
-
-                t_years = max(dte, 1) / 365.0
-                delta = bs_delta(spot, strike, t_years, rf_for_delta, iv, option_type) if iv else None
-
-                if option_type == "C":
-                    intrinsic = max(0.0, spot - strike)
-                else:
-                    intrinsic = max(0.0, strike - spot)
-
-                extrinsic = midpoint - intrinsic
+                if iv is not None and iv > 0:
+                    raw_ivs.append(iv)
 
                 contract_symbol = str(
                     r.get("contractSymbol") or f"{symbol}_{exp_date.isoformat()}_{strike}_{option_type}"
                 )
 
-                rows.append(
+                raw_rows.append(
                     {
                         "contract_id": contract_symbol,
                         "symbol": symbol,
@@ -458,9 +507,7 @@ def fetch_options_chain(
                         "spread_pct": spread_pct,
                         "volume": volume,
                         "open_interest": open_interest,
-                        "iv": iv,
-                        "delta": delta,
-                        "extrinsic_value": extrinsic,
+                        "iv_raw": iv,
                         "last_updated": now_iso,
                     }
                 )
@@ -468,12 +515,61 @@ def fetch_options_chain(
         # Throttle between expirations to reduce rate-limit risk (configurable).
         time.sleep(request_delay_seconds)
 
-    if iv_rescale_count:
+    if not raw_rows:
+        return pd.DataFrame(rows)
+
+    # Chain-level rescale decision: only treat the whole chain as
+    # mis-scaled (values reported as e.g. 35.0 instead of 0.35) when the
+    # majority of *valid, non-null* IV prints are implausibly large.
+    # A handful of legitimately high-IV far-OTM contracts should not flip
+    # this for the entire symbol.
+    rescale_threshold = float(cfg.get("iv_rescale_threshold", 3.0))
+    rescale_majority_frac = float(cfg.get("iv_rescale_majority_frac", 0.5))
+
+    chain_needs_rescale = False
+    if raw_ivs:
+        frac_over_threshold = sum(1 for v in raw_ivs if v > rescale_threshold) / len(raw_ivs)
+        chain_needs_rescale = frac_over_threshold >= rescale_majority_frac
+
+    if chain_needs_rescale:
         logging.info(
-            "%s: IV /100 rescale heuristic applied to %s contract(s) — review if unexpected",
+            "IV rescale applied at chain level: %s — %d/%d valid IV prints > %.1f, dividing whole chain by 100",
             symbol,
-            iv_rescale_count,
+            sum(1 for v in raw_ivs if v > rescale_threshold),
+            len(raw_ivs),
+            rescale_threshold,
         )
+
+    t_years_cache: Dict[int, float] = {}
+
+    for row in raw_rows:
+        iv = row.pop("iv_raw")
+
+        if iv is not None and chain_needs_rescale:
+            iv = iv / 100.0
+
+        if iv is not None and iv <= 0:
+            iv = None
+
+        dte = row["dte"]
+        if dte not in t_years_cache:
+            t_years_cache[dte] = max(dte, 1) / 365.0
+        t_years = t_years_cache[dte]
+
+        delta = bs_delta(spot, row["strike"], t_years, rf_for_delta, iv, row["type"]) if iv else None
+
+        if row["type"] == "C":
+            intrinsic = max(0.0, spot - row["strike"])
+        else:
+            intrinsic = max(0.0, row["strike"] - spot)
+
+        extrinsic = row["midpoint"] - intrinsic
+
+        row["iv"] = iv
+        row["delta"] = delta
+        row["extrinsic_value"] = extrinsic
+
+        rows.append(row)
 
     return pd.DataFrame(rows)
 
@@ -541,13 +637,23 @@ def get_iv_rank(
     IV Rank hierarchy:
 
     1. Manual override from broker / vendor.
-    2. Real historical-IV-based rank, once enough locally-accrued daily
-       IV30 observations exist (iv_history table, see min_iv_history_days).
-       This is what "IV Rank" is supposed to mean: today's IV vs its own
-       history — not a proxy against realized volatility.
-    3. Fallback planning-only estimate using historical realized volatility
-       (IV vs RV, not IV vs IV history). This is a materially weaker,
-       different signal and is always marked estimated=True.
+    2. True historical-IV-based IV Rank, once enough locally-accrued daily
+       IV30 observations exist (iv_history table, see min_iv_history_days):
+
+           IV Rank = (IV_today - IV_min_over_window) / (IV_max_over_window - IV_min_over_window) * 100
+
+       This is the standard min/max "IV Rank" definition used by most
+       brokerages. (Earlier versions of this function computed
+       `(hist < iv30).mean() * 100`, which is IV *Percentile* — the
+       fraction of days IV was lower than today — a related but distinct
+       number from IV Rank. Percentile and Rank can diverge meaningfully,
+       e.g. when most days cluster at the low end but the historical max
+       is far above today's reading. If comparing against a brokerage
+       screen labeled "IV Rank," this function's field of the same name
+       now uses the matching min/max formula.)
+    3. Fallback planning-only estimate using historical realized
+       volatility (IV vs RV, not IV vs IV history). This is a materially
+       weaker, different signal and is always marked estimated=True.
     4. Missing.
     """
     if symbol in overrides and overrides[symbol] is not None:
@@ -562,12 +668,28 @@ def get_iv_rank(
     if iv30 is not None and iv30_history is not None:
         hist = iv30_history.dropna()
         if len(hist) >= min_iv_history_days:
-            rank = float((hist < iv30).mean() * 100.0)
-            return {
-                "iv_rank": rank,
-                "source": "historical_iv_rank",
-                "estimated": False,
-            }
+            hist_min = float(hist.min())
+            hist_max = float(hist.max())
+            hist_range = hist_max - hist_min
+
+            if hist_range > 0:
+                rank = float((iv30 - hist_min) / hist_range * 100.0)
+                rank = max(0.0, min(100.0, rank))
+                return {
+                    "iv_rank": rank,
+                    "source": "historical_iv_rank",
+                    "estimated": False,
+                }
+            else:
+                # No variation in the historical window (e.g. all identical
+                # observations) — min/max IV Rank is undefined, not 0 or 100.
+                logging.warning(
+                    "%s: historical IV window has zero range (min=max=%.4f) over %s obs — "
+                    "IV Rank cannot be computed from this window",
+                    symbol,
+                    hist_min,
+                    len(hist),
+                )
 
     if (
         cfg.get("allow_estimated_iv_rank", False)
@@ -577,6 +699,12 @@ def get_iv_rank(
     ):
         series = rv30_series.dropna()
         if not series.empty:
+            # NOTE: this branch compares IV against a window of *realized
+            # volatility* observations, not against IV's own history — it
+            # is not a min/max IV Rank at all, just a rough stand-in used
+            # only until enough real IV30 history has accrued. Always
+            # marked estimated=True and downgrades the symbol to planning
+            # only (see evaluate_symbol).
             rank = float((series < iv30).mean() * 100.0)
             return {
                 "iv_rank": rank,
@@ -609,6 +737,8 @@ def empty_underlying(symbol: str, notes: str, rf_meta: Dict[str, Any]) -> Dict[s
         "earnings_date": None,
         "ex_div_date": None,
         "div_amount": None,
+        "div_amount_source": "missing",
+        "div_amount_estimated": 1,
         "iv30": None,
         "iv_rank": None,
         "iv_rank_source": "missing",
@@ -687,6 +817,8 @@ def process_symbol(
             "earnings_date": (fund.get("earnings_date").isoformat() if fund.get("earnings_date") else None),
             "ex_div_date": (fund.get("ex_div_date").isoformat() if fund.get("ex_div_date") else None),
             "div_amount": fund.get("dividend_amount"),
+            "div_amount_source": fund.get("dividend_amount_source"),
+            "div_amount_estimated": 1 if fund.get("dividend_amount_estimated") else 0,
             "iv30": iv30,
             "iv_rank": iv_rank_data["iv_rank"],
             "iv_rank_source": iv_rank_data["source"],
@@ -715,7 +847,7 @@ def process_symbol(
 
 
 # ----------------------------------------------------------------------------
-# Evaluation / v3.3 gates
+# Evaluation / v3.5 gates
 # ----------------------------------------------------------------------------
 
 
@@ -819,6 +951,11 @@ def evaluate_symbol(
     if bool(u.get("rf_estimated")):
         planning_only = True
         warnings.append("Risk-free rate is default/estimated")
+
+    if bool(u.get("div_amount_estimated")):
+        warnings.append(
+            "Dividend amount is estimated (annual_rate/4 fallback) rather than a " "verified last-actual-payment figure"
+        )
 
     max_data_age_hours = safe_float(cfg.get("max_data_age_hours", 24)) or 24.0
     last_updated_raw = u.get("last_updated")
@@ -1016,6 +1153,9 @@ def evaluate_symbol(
                 continue
 
             # Stage 9: dividend / early assignment risk
+            # NOTE: div_amount is now a *per-payment* estimate (see
+            # get_next_dividend_amount), not an annualized rate — do not
+            # revert this to dividendRate/trailingAnnualDividendRate.
             ex_div_date = parse_date(u.get("ex_div_date"))
             expiration_date = parse_date(c.get("expiration"))
             dividend_amount = safe_float(u.get("div_amount")) or 0.0
@@ -1159,7 +1299,7 @@ def evaluate_symbol(
 
     if planning_only:
         result["decision_label"] = "🟡 WAIT"
-        result["reasons"].append("Planning only: evidence is estimated/incomplete under v3.3 strict rules")
+        result["reasons"].append("Planning only: evidence is estimated/incomplete under v3.5 strict rules")
     else:
         result["decision_label"] = "🟢 AUTHORIZED"
 
@@ -1310,7 +1450,7 @@ def write_report(
 
     # Markdown
     lines: List[str] = []
-    lines.append("# Options Trading Plan v3.3 — Actionable Report")
+    lines.append("# Options Trading Plan v3.5 — Actionable Report")
     lines.append("")
     lines.append(f"Generated: {datetime.now().isoformat()}")
     lines.append("")
