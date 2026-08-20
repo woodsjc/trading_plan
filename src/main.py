@@ -60,9 +60,7 @@ def main():
         retry_backoff_seconds=retry_backoff_seconds,
     )
 
-    overrides = load_iv_rank_overrides(
-        config.get("iv_rank_override_file", "iv_rank_overrides.csv")
-    )
+    overrides = load_iv_rank_overrides(config.get("iv_rank_override_file", "iv_rank_overrides.csv"))
 
     db_path = Path(config.get("database_path", "options_v33.db"))
     iv30_history_map = load_iv30_history(db_path)
@@ -112,13 +110,9 @@ def main():
     # Batch completeness check: a low fraction of symbols returning a
     # usable options chain is a signal of rate limiting / partial outage
     # rather than every symbol legitimately lacking listed options.
-    symbols_with_options = sum(
-        1 for df in contract_frames if df is not None and not df.empty
-    )
+    symbols_with_options = sum(1 for df in contract_frames if df is not None and not df.empty)
     completeness_pct = (symbols_with_options / len(symbols)) * 100.0 if symbols else 0.0
-    min_batch_completeness_pct = (
-        safe_float(config.get("min_batch_completeness_pct", 80.0)) or 80.0
-    )
+    min_batch_completeness_pct = safe_float(config.get("min_batch_completeness_pct", 80.0)) or 80.0
     degraded = completeness_pct < min_batch_completeness_pct
 
     batch_stats = {
@@ -176,9 +170,7 @@ def main():
             "; ".join(portfolio_stress.get("regime_flags", [])),
         )
 
-    write_report(
-        results, config, portfolio_stress=portfolio_stress, batch_stats=batch_stats
-    )
+    write_report(results, config, portfolio_stress=portfolio_stress, batch_stats=batch_stats)
 
     conn.close()
 

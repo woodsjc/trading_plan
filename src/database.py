@@ -87,7 +87,6 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-
 def connect(db_path: Path) -> sqlite3.Connection:
     """
     Open (creating the parent directory if needed) and initialize the
@@ -102,9 +101,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def save_underlying_rows(
-    conn: sqlite3.Connection, underlying_rows: List[Dict[str, Any]]
-) -> None:
+def save_underlying_rows(conn: sqlite3.Connection, underlying_rows: List[Dict[str, Any]]) -> None:
     if not underlying_rows:
         return
 
@@ -117,9 +114,7 @@ def save_underlying_rows(
     conn.commit()
 
 
-def save_option_contracts(
-    conn: sqlite3.Connection, contract_frames: List[pd.DataFrame]
-) -> None:
+def save_option_contracts(conn: sqlite3.Connection, contract_frames: List[pd.DataFrame]) -> None:
     if not contract_frames:
         return
 
@@ -168,9 +163,7 @@ def load_iv30_history(db_path: Path) -> Dict[str, "pd.Series"]:
         finally:
             conn.close()
     except Exception as exc:
-        logging.info(
-            "No usable iv_history yet (%s) — will use RV proxy/manual override.", exc
-        )
+        logging.info("No usable iv_history yet (%s) — will use RV proxy/manual override.", exc)
         return {}
 
     if df.empty:
@@ -178,18 +171,14 @@ def load_iv30_history(db_path: Path) -> Dict[str, "pd.Series"]:
 
     out: Dict[str, pd.Series] = {}
     for sym, group in df.groupby("symbol"):
-        series = pd.to_numeric(
-            group.sort_values("date")["iv30"], errors="coerce"
-        ).dropna()
+        series = pd.to_numeric(group.sort_values("date")["iv30"], errors="coerce").dropna()
         if not series.empty:
             out[str(sym)] = series.reset_index(drop=True)
 
     return out
 
 
-def upsert_iv_history(
-    conn: sqlite3.Connection, underlying_rows: List[Dict[str, Any]]
-) -> None:
+def upsert_iv_history(conn: sqlite3.Connection, underlying_rows: List[Dict[str, Any]]) -> None:
     """
     Append today's IV30/RV snapshot per symbol into the never-dropped
     iv_history table. INSERT OR REPLACE keyed on (symbol, date) makes this

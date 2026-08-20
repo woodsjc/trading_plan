@@ -42,9 +42,7 @@ def call_with_backoff(
     while attempt <= max_retries:
         try:
             return fn(*args, **kwargs)
-        except (
-            Exception
-        ) as exc:  # noqa: BLE001 - deliberately broad, this wraps 3rd-party calls
+        except Exception as exc:  # noqa: BLE001 - deliberately broad, this wraps 3rd-party calls
             last_exc = exc
             attempt += 1
             if attempt > max_retries:
@@ -91,9 +89,7 @@ def bs_delta(
         if spot <= 0 or strike <= 0 or t_years <= 0 or iv <= 0:
             return None
 
-        d1 = (math.log(spot / strike) + (rf + 0.5 * iv * iv) * t_years) / (
-            iv * math.sqrt(t_years)
-        )
+        d1 = (math.log(spot / strike) + (rf + 0.5 * iv * iv) * t_years) / (iv * math.sqrt(t_years))
 
         if option_type.upper().startswith("C"):
             return norm_cdf(d1)
@@ -293,17 +289,9 @@ def fetch_fundamentals(
     except Exception as exc:
         logging.warning("Info failed for %s after retries: %s", symbol, exc)
 
-    price = (
-        info.get("regularMarketPrice")
-        or info.get("currentPrice")
-        or info.get("previousClose")
-    )
+    price = info.get("regularMarketPrice") or info.get("currentPrice") or info.get("previousClose")
 
-    avg_volume = (
-        info.get("averageVolume")
-        or info.get("averageDailyVolume10Day")
-        or info.get("volume")
-    )
+    avg_volume = info.get("averageVolume") or info.get("averageDailyVolume10Day") or info.get("volume")
 
     market_cap = info.get("marketCap")
     beta = info.get("beta")
@@ -354,9 +342,7 @@ def fetch_options_chain(
             label=f"tk.options({symbol})",
         )
     except Exception as exc:
-        logging.warning(
-            "Options expirations failed for %s after retries: %s", symbol, exc
-        )
+        logging.warning("Options expirations failed for %s after retries: %s", symbol, exc)
         return pd.DataFrame(rows)
 
     if not expirations:
@@ -388,9 +374,7 @@ def fetch_options_chain(
                 label=f"tk.option_chain({symbol}, {exp})",
             )
         except Exception as exc:
-            logging.warning(
-                "Option chain failed for %s %s after retries: %s", symbol, exp, exc
-            )
+            logging.warning("Option chain failed for %s %s after retries: %s", symbol, exp, exc)
             continue
 
         datasets = [
@@ -446,11 +430,7 @@ def fetch_options_chain(
                     iv = None
 
                 t_years = max(dte, 1) / 365.0
-                delta = (
-                    bs_delta(spot, strike, t_years, rf_for_delta, iv, option_type)
-                    if iv
-                    else None
-                )
+                delta = bs_delta(spot, strike, t_years, rf_for_delta, iv, option_type) if iv else None
 
                 if option_type == "C":
                     intrinsic = max(0.0, spot - strike)
@@ -460,8 +440,7 @@ def fetch_options_chain(
                 extrinsic = midpoint - intrinsic
 
                 contract_symbol = str(
-                    r.get("contractSymbol")
-                    or f"{symbol}_{exp_date.isoformat()}_{strike}_{option_type}"
+                    r.get("contractSymbol") or f"{symbol}_{exp_date.isoformat()}_{strike}_{option_type}"
                 )
 
                 rows.append(
@@ -617,9 +596,7 @@ def get_iv_rank(
 # ----------------------------------------------------------------------------
 
 
-def empty_underlying(
-    symbol: str, notes: str, rf_meta: Dict[str, Any]
-) -> Dict[str, Any]:
+def empty_underlying(symbol: str, notes: str, rf_meta: Dict[str, Any]) -> Dict[str, Any]:
     now_iso = datetime.now().isoformat()
 
     return {
@@ -707,14 +684,8 @@ def process_symbol(
             "average_volume": fund.get("average_volume"),
             "market_cap": fund.get("market_cap"),
             "beta": fund.get("beta"),
-            "earnings_date": (
-                fund.get("earnings_date").isoformat()
-                if fund.get("earnings_date")
-                else None
-            ),
-            "ex_div_date": (
-                fund.get("ex_div_date").isoformat() if fund.get("ex_div_date") else None
-            ),
+            "earnings_date": (fund.get("earnings_date").isoformat() if fund.get("earnings_date") else None),
+            "ex_div_date": (fund.get("ex_div_date").isoformat() if fund.get("ex_div_date") else None),
             "div_amount": fund.get("dividend_amount"),
             "iv30": iv30,
             "iv_rank": iv_rank_data["iv_rank"],
@@ -738,9 +709,7 @@ def process_symbol(
     except Exception as exc:
         logging.exception("process_symbol failed for %s", symbol)
         return {
-            "underlying": empty_underlying(
-                symbol, f"process_symbol exception: {exc}", rf_meta
-            ),
+            "underlying": empty_underlying(symbol, f"process_symbol exception: {exc}", rf_meta),
             "options": pd.DataFrame(),
         }
 
@@ -859,10 +828,7 @@ def evaluate_symbol(
         age_hours = (datetime.now() - last_updated_dt).total_seconds() / 3600.0
 
         if age_hours > max_data_age_hours:
-            msg = (
-                f"Stage 0: data is {age_hours:.1f}h old, exceeds "
-                f"max_data_age_hours={max_data_age_hours}"
-            )
+            msg = f"Stage 0: data is {age_hours:.1f}h old, exceeds " f"max_data_age_hours={max_data_age_hours}"
             if strict_evidence:
                 return incomplete(msg)
 
@@ -918,9 +884,7 @@ def evaluate_symbol(
         return reject("Stage 2: primary VRP is not positive")
 
     if rv20 is not None and iv30 <= rv20:
-        warnings.append(
-            "Stage 2: IV30 <= RV20D, multi-horizon VRP confirmation is weak"
-        )
+        warnings.append("Stage 2: IV30 <= RV20D, multi-horizon VRP confirmation is weak")
 
     result["iv_rank"] = iv_rank
     result["vrp_ratio"] = vrp_ratio
@@ -939,9 +903,7 @@ def evaluate_symbol(
         days_to_earnings = (earnings_date - date.today()).days
 
         if 0 <= days_to_earnings <= dte_max + earnings_buffer:
-            return reject(
-                f"Stage 3: earnings in {days_to_earnings} days, inside standard option life"
-            )
+            return reject(f"Stage 3: earnings in {days_to_earnings} days, inside standard option life")
     else:
         warnings.append("Stage 3: earnings date not verified")
 
@@ -982,9 +944,7 @@ def evaluate_symbol(
     min_open_interest = safe_float(screen.get("min_open_interest", 250)) or 250.0
     min_volume = safe_float(screen.get("min_volume", 10)) or 10.0
     max_spread_pct = safe_float(screen.get("max_spread_pct", 0.10)) or 0.10
-    min_premium_cost_ratio = (
-        safe_float(screen.get("min_premium_cost_ratio", 5.0)) or 5.0
-    )
+    min_premium_cost_ratio = safe_float(screen.get("min_premium_cost_ratio", 5.0)) or 5.0
 
     valid = contracts_df[
         contracts_df["dte"].between(dte_min, dte_max)
@@ -996,9 +956,7 @@ def evaluate_symbol(
     ].copy()
 
     if valid.empty:
-        return reject(
-            "Stage 4/5: no contract satisfies DTE/delta/OI/volume/spread gates"
-        )
+        return reject("Stage 4/5: no contract satisfies DTE/delta/OI/volume/spread gates")
 
     # ------------------------------------------------------------------
     # Contract-level economic gates
@@ -1062,12 +1020,7 @@ def evaluate_symbol(
             expiration_date = parse_date(c.get("expiration"))
             dividend_amount = safe_float(u.get("div_amount")) or 0.0
 
-            if (
-                ex_div_date
-                and expiration_date
-                and ex_div_date <= expiration_date
-                and dividend_amount > 0
-            ):
+            if ex_div_date and expiration_date and ex_div_date <= expiration_date and dividend_amount > 0:
                 extrinsic = safe_float(c.get("extrinsic_value"))
 
                 if extrinsic is None:
@@ -1081,18 +1034,12 @@ def evaluate_symbol(
 
                 candidate_warnings.append("Contract crosses ex-dividend date")
 
-            if (
-                strategy == "Buy-Write Covered Call"
-                and enforce_sizing
-                and max_position_capital is not None
-            ):
+            if strategy == "Buy-Write Covered Call" and enforce_sizing and max_position_capital is not None:
                 spot = safe_float(u.get("price"))
                 if spot is not None:
                     stock_cost = spot * 100.0
                     if stock_cost > max_position_capital:
-                        candidate_warnings.append(
-                            "Buy-write stock exposure exceeds configured position cap"
-                        )
+                        candidate_warnings.append("Buy-write stock exposure exceeds configured position cap")
 
         # --------------------------------------------------------------
         # Cash-secured put
@@ -1144,9 +1091,7 @@ def evaluate_symbol(
         )
 
     if not candidates:
-        return reject(
-            "Stage 6/7/9: no contract passed premium, risk hurdle, dividend, or sizing checks"
-        )
+        return reject("Stage 6/7/9: no contract passed premium, risk hurdle, dividend, or sizing checks")
 
     # Choose the strongest contract by execution-cost-adjusted premium.
     best = max(
@@ -1177,12 +1122,7 @@ def evaluate_symbol(
     spread_pct = safe_float(best.get("spread_pct"))
     open_interest = safe_float(best.get("open_interest"))
 
-    if (
-        spread_pct is not None
-        and spread_pct <= 0.05
-        and open_interest is not None
-        and open_interest >= 1000
-    ):
+    if spread_pct is not None and spread_pct <= 0.05 and open_interest is not None and open_interest >= 1000:
         score += 15.0
     else:
         score += 10.0
@@ -1219,9 +1159,7 @@ def evaluate_symbol(
 
     if planning_only:
         result["decision_label"] = "🟡 WAIT"
-        result["reasons"].append(
-            "Planning only: evidence is estimated/incomplete under v3.3 strict rules"
-        )
+        result["reasons"].append("Planning only: evidence is estimated/incomplete under v3.3 strict rules")
     else:
         result["decision_label"] = "🟢 AUTHORIZED"
 
@@ -1243,9 +1181,7 @@ def evaluate_symbol(
 # portfolio-level sanity check, per Stage 32 of the rulebook.
 
 
-def evaluate_portfolio_stress(
-    results: List[Dict[str, Any]], cfg: Dict[str, Any]
-) -> Dict[str, Any]:
+def evaluate_portfolio_stress(results: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
     portfolio = cfg.get("portfolio", {}) or {}
 
     benchmark = portfolio.get("benchmark", "SPY")
@@ -1254,15 +1190,9 @@ def evaluate_portfolio_stress(
     current_drawdown_pct = safe_float(portfolio.get("current_drawdown_pct", 0.0)) or 0.0
     hedge_status = str(portfolio.get("hedge_status", "unhedged"))
     stress_shocks_pct = portfolio.get("stress_shocks_pct", [-20, -30]) or [-20, -30]
-    regime_review_drawdown = (
-        safe_float(portfolio.get("regime_review_drawdown_pct", 10.0)) or 10.0
-    )
-    regime_severe_drawdown = (
-        safe_float(portfolio.get("regime_severe_drawdown_pct", 15.0)) or 15.0
-    )
-    regime_vix_threshold = (
-        safe_float(portfolio.get("regime_vix_threshold", 30.0)) or 30.0
-    )
+    regime_review_drawdown = safe_float(portfolio.get("regime_review_drawdown_pct", 10.0)) or 10.0
+    regime_severe_drawdown = safe_float(portfolio.get("regime_severe_drawdown_pct", 15.0)) or 15.0
+    regime_vix_threshold = safe_float(portfolio.get("regime_vix_threshold", 30.0)) or 30.0
     portfolio_value = safe_float(portfolio.get("value"))
 
     authorized = [r for r in results if r.get("decision_label") == "🟢 AUTHORIZED"]
@@ -1328,9 +1258,7 @@ def evaluate_portfolio_stress(
 
     if current_vix is not None and current_vix >= regime_vix_threshold:
         regime_state = "severe" if regime_state == "normal" else regime_state
-        regime_flags.append(
-            f"VIX {current_vix:.1f} >= {regime_vix_threshold:.1f} — hard review trigger (Stage 14)."
-        )
+        regime_flags.append(f"VIX {current_vix:.1f} >= {regime_vix_threshold:.1f} — hard review trigger (Stage 14).")
     elif current_vix is None:
         regime_flags.append(
             "current_vix not set in config.yaml — VIX circuit breaker is disabled. "
@@ -1413,21 +1341,15 @@ def write_report(
             "(no free VIX/drawdown feed exists) — see plan.md Section 7 for scope."
         )
         lines.append("")
-        lines.append(
-            f"- AUTHORIZED candidates today: {portfolio_stress.get('authorized_count')}"
-        )
+        lines.append(f"- AUTHORIZED candidates today: {portfolio_stress.get('authorized_count')}")
         lines.append(
             f"- Illustrative beta-weighted delta exposure (1 contract each, shares-equivalent): "
             f"{portfolio_stress.get('total_beta_weighted_delta_shares')}"
         )
         for label, loss in (portfolio_stress.get("stress_results") or {}).items():
-            lines.append(
-                f"- Stress {label}: approx {loss} shares-equivalent P/L impact"
-            )
+            lines.append(f"- Stress {label}: approx {loss} shares-equivalent P/L impact")
         lines.append(f"- Hedge status: {portfolio_stress.get('hedge_status')}")
-        lines.append(
-            f"- Current drawdown: {portfolio_stress.get('current_drawdown_pct')}%"
-        )
+        lines.append(f"- Current drawdown: {portfolio_stress.get('current_drawdown_pct')}%")
         lines.append(f"- Current VIX: {portfolio_stress.get('current_vix')}")
         lines.append(f"- Regime state: **{portfolio_stress.get('regime_state')}**")
         for flag in portfolio_stress.get("regime_flags", []):

@@ -16,7 +16,7 @@ def safe_float(x: Any) -> Optional[float]:
         if isinstance(x, str) and x.strip() == "":
             return None
         return float(x)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 
