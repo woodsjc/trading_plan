@@ -150,33 +150,33 @@ The Python script should output a daily "Actionable Report" using the exact v3.5
 ```python
 def run_v3_plan(symbol):
     data = db.fetch_symbol_data(symbol)
-    
+
     # Stage 0: Data Completeness
     if not data.is_complete():
         return "⚪ DATA INCOMPLETE — DO NOT AUTHORIZE"
-        
+
     # Stage 1 & 3: Underlying & Catalyst
     if data.earnings_date < data.target_dte + 7:
         return "🔴 REJECT: Earnings inside DTE"
-        
+
     # Stage 2: Volatility (The Edge)
     if data.iv_rank < 30:
         return "🔴 REJECT: IV Rank < 30"
     if data.vrp_ratio < 1.05:
         return "🔴 REJECT: VRP Ratio < 1.05"
-        
+
     # Stage 5: Liquidity
     valid_contracts = data.options[
-        (data.options.dte.between(30, 40)) &
-        (data.options.oi >= 250) & 
-        (data.options.volume >= 10) & 
-        (data.options.spread_pct <= 0.10) &
-        (data.options.delta.between(0.15, 0.30))
+        (data.options.dte.between(30, 40))
+        & (data.options.oi >= 250)
+        & (data.options.volume >= 10)
+        & (data.options.spread_pct <= 0.10)
+        & (data.options.delta.between(0.15, 0.30))
     ]
-    
+
     if valid_contracts.empty:
         return "🔴 REJECT: No liquid contracts in delta range"
-        
+
     # Stage 6 & 7: Premium & RF Hurdle
     best_contract = calculate_best_risk_adjusted_premium(valid_contracts)
     if best_contract.premium_to_cost_ratio < 5:

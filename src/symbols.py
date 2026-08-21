@@ -1,10 +1,10 @@
-from typing import Any, Dict, List, Optional
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
 
-def load_symbols(cfg: Dict[str, Any]) -> List[str]:
+def load_symbols(cfg: dict[str, Any]) -> list[str]:
     symbols = cfg.get("symbols") or []
 
     symbols_file = cfg.get("symbols_file")

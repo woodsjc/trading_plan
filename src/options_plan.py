@@ -1,22 +1,21 @@
-import importlib.util
 import logging
 import math
-import os
 import sqlite3
-import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
 
 from database import load_options_contracts, load_underlying_metrics
 from parsing import parse_date, safe_float
+
+log = logging.getLogger(__name__)
+now_eastern_time = datetime.now(ZoneInfo("America/New_York"))
 
 
 def call_with_backoff(
@@ -37,18 +36,18 @@ def call_with_backoff(
     DATA INCOMPLETE) on the first hiccup.
     """
     attempt = 0
-    last_exc: Optional[Exception] = None
+    last_exc: Exception | None = None
 
     while attempt <= max_retries:
         try:
             return fn(*args, **kwargs)
-        except Exception as exc:  # noqa: BLE001 - deliberately broad, this wraps 3rd-party calls
+        except Exception as exc:
             last_exc = exc
             attempt += 1
             if attempt > max_retries:
                 break
             delay = base_delay * (2 ** (attempt - 1))
-            logging.warning(
+            log.warning(
                 "%s failed (attempt %s/%s): %s — retrying in %.1fs",
                 label or getattr(fn, "__name__", "call"),
                 attempt,
@@ -58,7 +57,7 @@ def call_with_backoff(
             )
             time.sleep(delay)
 
-    logging.error(
+    log.error(
         "%s failed after %s attempts: %s",
         label or getattr(fn, "__name__", "call"),
         max_retries,
@@ -78,7 +77,7 @@ def bs_delta(
     rf: float,
     iv: float,
     option_type: str,
-) -> Optional[float]:
+) -> float | None:
     """
     Black-Scholes delta approximation.
 
@@ -109,17 +108,17 @@ def bs_delta(
 
 
 def fetch_price_history(
-    symbols: List[str],
+    symbols: list[str],
     period: str = "1y",
     max_retries: int = 3,
     retry_backoff_seconds: float = 1.0,
-) -> Dict[str, Dict[str, Any]]:
+) -> dict[str, dict[str, Any]]:
     """
     Batch-download price history for all symbols.
 
     This is the part that efficiently handles ~100 symbols at once.
     """
-    out: Dict[str, Dict[str, Any]] = {
+    out: dict[str, dict[str, Any]] = {
         sym: {
             "last_price": None,
             "rv20": None,
@@ -132,7 +131,7 @@ def fetch_price_history(
     if not symbols:
         return out
 
-    logging.info("Downloading batch price history for %s symbols", len(symbols))
+    log.info("Downloading batch price history for %s symbols", len(symbols))
 
     try:
         data = call_with_backoff(
@@ -149,16 +148,16 @@ def fetch_price_history(
             label="yf.download(batch price history)",
         )
     except Exception as exc:
-        logging.error("yf.download failed after retries: %s", exc)
+        log.error("yf.download failed after retries: %s", exc)
         return out
 
     if data is None or data.empty:
-        logging.warning("Price history download returned empty data")
+        log.warning("Price history download returned empty data")
         return out
 
     for sym in symbols:
         try:
-            close: Optional[pd.Series] = None
+            close: pd.Series | None = None
 
             if isinstance(data.columns, pd.MultiIndex):
                 level0 = data.columns.get_level_values(0)
@@ -206,7 +205,7 @@ def fetch_price_history(
             }
 
         except Exception as exc:
-            logging.warning("Price history failed for %s: %s", sym, exc)
+            log.warning("Price history failed for %s: %s", sym, exc)
 
     return out
 
@@ -216,8 +215,8 @@ def fetch_price_history(
 # ----------------------------------------------------------------------------
 
 
-def get_earnings_date(tk: yf.Ticker, info: Dict[str, Any]) -> Optional[date]:
-    candidates: List[date] = []
+def get_earnings_date(tk: yf.Ticker, info: dict[str, Any]) -> date | None:
+    candidates: list[date] = []
 
     for key in [
         "earningsTimestamp",
@@ -257,29 +256,29 @@ def get_earnings_date(tk: yf.Ticker, info: Dict[str, Any]) -> Optional[date]:
                     if parsed:
                         candidates.append(parsed)
 
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Caught error: {e}")
 
     try:
         earnings_dates = tk.earnings_dates
         if earnings_dates is not None and not earnings_dates.empty:
             for idx in earnings_dates.index:
                 parsed = parse_date(idx)
-                if parsed and parsed >= date.today() - timedelta(days=1):
+                if parsed and parsed >= now_eastern_time.date() - timedelta(days=1):
                     candidates.append(parsed)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Caught error: {e}")
 
-    future = [d for d in candidates if d and d >= date.today() - timedelta(days=1)]
+    future = [d for d in candidates if d and d >= now_eastern_time.date() - timedelta(days=1)]
     return min(future) if future else None
 
 
 def get_next_dividend_amount(
     tk: yf.Ticker,
-    info: Dict[str, Any],
+    info: dict[str, Any],
     max_retries: int = 3,
     retry_backoff_seconds: float = 1.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Estimate the amount of the *next single* dividend payment.
 
@@ -314,7 +313,7 @@ def get_next_dividend_amount(
                     "estimated": False,
                 }
     except Exception as exc:
-        logging.warning("tk.dividends failed: %s", exc)
+        log.warning("tk.dividends failed: %s", exc)
 
     annual_rate = safe_float(info.get("dividendRate")) or safe_float(info.get("trailingAnnualDividendRate"))
     if annual_rate is not None and annual_rate > 0:
@@ -337,10 +336,10 @@ def fetch_fundamentals(
     symbol: str,
     max_retries: int = 3,
     retry_backoff_seconds: float = 1.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     tk = yf.Ticker(symbol)
 
-    info: Dict[str, Any] = {}
+    info: dict[str, Any] = {}
     try:
         info = call_with_backoff(
             lambda: tk.info or {},
@@ -349,7 +348,7 @@ def fetch_fundamentals(
             label=f"tk.info({symbol})",
         )
     except Exception as exc:
-        logging.warning("Info failed for %s after retries: %s", symbol, exc)
+        log.warning("Info failed for %s after retries: %s", symbol, exc)
 
     price = info.get("regularMarketPrice") or info.get("currentPrice") or info.get("previousClose")
 
@@ -388,11 +387,11 @@ def fetch_fundamentals(
 
 def fetch_options_chain(
     symbol: str,
-    spot: Optional[float],
-    rf_rate: Optional[float],
-    cfg: Dict[str, Any],
+    spot: float | None,
+    rf_rate: float | None,
+    cfg: dict[str, Any],
 ) -> pd.DataFrame:
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
 
     if spot is None or spot <= 0:
         return pd.DataFrame(rows)
@@ -411,17 +410,17 @@ def fetch_options_chain(
             label=f"tk.options({symbol})",
         )
     except Exception as exc:
-        logging.warning("Options expirations failed for %s after retries: %s", symbol, exc)
+        log.warning("Options expirations failed for %s after retries: %s", symbol, exc)
         return pd.DataFrame(rows)
 
     if not expirations:
         return pd.DataFrame(rows)
 
-    today = date.today()
+    today = now_eastern_time.date()
     min_dte_fetch = int(cfg.get("min_dte_fetch", 30))
     max_dte_fetch = int(cfg.get("max_dte_fetch", 40))
     rf_for_delta = rf_rate if rf_rate is not None else 0.0
-    now_iso = datetime.now().isoformat()
+    now_iso = now_eastern_time.isoformat()
 
     # Raw rows are collected first and the IV-rescale decision is made once
     # per symbol (see below) rather than per-contract. A per-contract
@@ -432,13 +431,14 @@ def fetch_options_chain(
     # units bug; if only a handful of far-OTM contracts are >3.0 while the
     # bulk of the chain is normally scaled, those individual prints are
     # left alone and are far more likely to be genuine.
-    raw_rows: List[Dict[str, Any]] = []
-    raw_ivs: List[float] = []
+    raw_rows: list[dict[str, Any]] = []
+    raw_ivs: list[float] = []
 
     for exp in expirations:
         try:
-            exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
-        except Exception:
+            exp_date = datetime.strptime(exp, "%Y-%m-%d").replace(tzinfo=ZoneInfo("America/New_York")).date()
+        except Exception as e:
+            log.warning(f"Continuing on error: {e}")
             continue
 
         dte = (exp_date - today).days
@@ -454,7 +454,7 @@ def fetch_options_chain(
                 label=f"tk.option_chain({symbol}, {exp})",
             )
         except Exception as exc:
-            logging.warning("Option chain failed for %s %s after retries: %s", symbol, exp, exc)
+            log.warning("Option chain failed for %s %s after retries: %s", symbol, exp, exc)
             continue
 
         datasets = [
@@ -532,7 +532,7 @@ def fetch_options_chain(
         chain_needs_rescale = frac_over_threshold >= rescale_majority_frac
 
     if chain_needs_rescale:
-        logging.info(
+        log.info(
             "IV rescale applied at chain level: %s — %d/%d valid IV prints > %.1f, dividing whole chain by 100",
             symbol,
             sum(1 for v in raw_ivs if v > rescale_threshold),
@@ -540,7 +540,7 @@ def fetch_options_chain(
             rescale_threshold,
         )
 
-    t_years_cache: Dict[int, float] = {}
+    t_years_cache: dict[int, float] = {}
 
     for row in raw_rows:
         iv = row.pop("iv_raw")
@@ -574,7 +574,7 @@ def fetch_options_chain(
     return pd.DataFrame(rows)
 
 
-def compute_iv30(options_df: pd.DataFrame, spot: Optional[float]) -> Optional[float]:
+def compute_iv30(options_df: pd.DataFrame, spot: float | None) -> float | None:
     """
     Estimate IV30 from nearest 30-day expiration ATM options.
 
@@ -601,7 +601,7 @@ def compute_iv30(options_df: pd.DataFrame, spot: Optional[float]) -> Optional[fl
         return None
 
 
-def load_iv_rank_overrides(path: str) -> Dict[str, Optional[float]]:
+def load_iv_rank_overrides(path: str) -> dict[str, float | None]:
     if not path:
         return {}
 
@@ -614,25 +614,25 @@ def load_iv_rank_overrides(path: str) -> Dict[str, Optional[float]]:
         if "symbol" not in df.columns or "iv_rank" not in df.columns:
             return {}
 
-        out: Dict[str, Optional[float]] = {}
+        out: dict[str, float | None] = {}
         for _, row in df.iterrows():
             sym = str(row["symbol"]).strip().upper()
             out[sym] = safe_float(row["iv_rank"])
         return out
 
     except Exception as exc:
-        logging.warning("Could not load IV Rank overrides: %s", exc)
+        log.warning("Could not load IV Rank overrides: %s", exc)
         return {}
 
 
 def get_iv_rank(
     symbol: str,
-    iv30: Optional[float],
-    rv30_series: Optional[pd.Series],
-    overrides: Dict[str, Optional[float]],
-    cfg: Dict[str, Any],
-    iv30_history: Optional[pd.Series] = None,
-) -> Dict[str, Any]:
+    iv30: float | None,
+    rv30_series: pd.Series | None,
+    overrides: dict[str, float | None],
+    cfg: dict[str, Any],
+    iv30_history: pd.Series | None = None,
+) -> dict[str, Any]:
     """
     IV Rank hierarchy:
 
@@ -683,7 +683,7 @@ def get_iv_rank(
             else:
                 # No variation in the historical window (e.g. all identical
                 # observations) — min/max IV Rank is undefined, not 0 or 100.
-                logging.warning(
+                log.warning(
                     "%s: historical IV window has zero range (min=max=%.4f) over %s obs — "
                     "IV Rank cannot be computed from this window",
                     symbol,
@@ -724,8 +724,8 @@ def get_iv_rank(
 # ----------------------------------------------------------------------------
 
 
-def empty_underlying(symbol: str, notes: str, rf_meta: Dict[str, Any]) -> Dict[str, Any]:
-    now_iso = datetime.now().isoformat()
+def empty_underlying(symbol: str, notes: str, rf_meta: dict[str, Any]) -> dict[str, Any]:
+    now_iso = now_eastern_time.isoformat()
 
     return {
         "symbol": symbol,
@@ -756,12 +756,12 @@ def empty_underlying(symbol: str, notes: str, rf_meta: Dict[str, Any]) -> Dict[s
 
 def process_symbol(
     symbol: str,
-    cfg: Dict[str, Any],
-    history: Dict[str, Dict[str, Any]],
-    overrides: Dict[str, Optional[float]],
-    rf_meta: Dict[str, Any],
-    iv30_history_map: Optional[Dict[str, pd.Series]] = None,
-) -> Dict[str, Any]:
+    cfg: dict[str, Any],
+    history: dict[str, dict[str, Any]],
+    overrides: dict[str, float | None],
+    rf_meta: dict[str, Any],
+    iv30_history_map: dict[str, pd.Series] | None = None,
+) -> dict[str, Any]:
     try:
         max_retries = int(cfg.get("max_retries", 3))
         retry_backoff_seconds = float(cfg.get("retry_backoff_seconds", 1.0))
@@ -809,7 +809,7 @@ def process_symbol(
 
         underlying = {
             "symbol": symbol,
-            "last_updated": datetime.now().isoformat(),
+            "last_updated": now_eastern_time.isoformat(),
             "price": spot,
             "average_volume": fund.get("average_volume"),
             "market_cap": fund.get("market_cap"),
@@ -839,7 +839,7 @@ def process_symbol(
         }
 
     except Exception as exc:
-        logging.exception("process_symbol failed for %s", symbol)
+        log.exception("process_symbol failed for %s", symbol)
         return {
             "underlying": empty_underlying(symbol, f"process_symbol exception: {exc}", rf_meta),
             "options": pd.DataFrame(),
@@ -851,7 +851,7 @@ def process_symbol(
 # ----------------------------------------------------------------------------
 
 
-def base_result(symbol: str) -> Dict[str, Any]:
+def base_result(symbol: str) -> dict[str, Any]:
     return {
         "symbol": symbol,
         "decision_label": "⚪ DATA INCOMPLETE — DO NOT AUTHORIZE",
@@ -878,19 +878,19 @@ def base_result(symbol: str) -> Dict[str, Any]:
 
 def evaluate_symbol(
     symbol: str,
-    cfg: Dict[str, Any],
+    cfg: dict[str, Any],
     conn: sqlite3.Connection,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     result = base_result(symbol)
-    warnings: List[str] = []
+    warnings: list[str] = []
     planning_only = False
 
-    def reject(msg: str) -> Dict[str, Any]:
+    def reject(msg: str) -> dict[str, Any]:
         result["decision_label"] = "🔴 REJECT"
         result["reasons"].append(msg)
         return result
 
-    def incomplete(msg: str) -> Dict[str, Any]:
+    def incomplete(msg: str) -> dict[str, Any]:
         result["decision_label"] = "⚪ DATA INCOMPLETE — DO NOT AUTHORIZE"
         result["reasons"].append(msg)
         return result
@@ -954,7 +954,7 @@ def evaluate_symbol(
 
     if bool(u.get("div_amount_estimated")):
         warnings.append(
-            "Dividend amount is estimated (annual_rate/4 fallback) rather than a " "verified last-actual-payment figure"
+            "Dividend amount is estimated (annual_rate/4 fallback) rather than a verified last-actual-payment figure"
         )
 
     max_data_age_hours = safe_float(cfg.get("max_data_age_hours", 24)) or 24.0
@@ -962,10 +962,10 @@ def evaluate_symbol(
 
     try:
         last_updated_dt = datetime.fromisoformat(str(last_updated_raw))
-        age_hours = (datetime.now() - last_updated_dt).total_seconds() / 3600.0
+        age_hours = (now_eastern_time - last_updated_dt).total_seconds() / 3600.0
 
         if age_hours > max_data_age_hours:
-            msg = f"Stage 0: data is {age_hours:.1f}h old, exceeds " f"max_data_age_hours={max_data_age_hours}"
+            msg = f"Stage 0: data is {age_hours:.1f}h old, exceeds max_data_age_hours={max_data_age_hours}"
             if strict_evidence:
                 return incomplete(msg)
 
@@ -1037,7 +1037,7 @@ def evaluate_symbol(
     earnings_buffer = safe_float(screen.get("earnings_buffer_days", 7)) or 7.0
 
     if earnings_date is not None:
-        days_to_earnings = (earnings_date - date.today()).days
+        days_to_earnings = (earnings_date - now_eastern_time.date()).days
 
         if 0 <= days_to_earnings <= dte_max + earnings_buffer:
             return reject(f"Stage 3: earnings in {days_to_earnings} days, inside standard option life")
@@ -1111,10 +1111,10 @@ def evaluate_symbol(
     if portfolio_value is not None and max_position_pct is not None:
         max_position_capital = portfolio_value * max_position_pct / 100.0
 
-    candidates: List[Dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
 
     for _, c in valid.iterrows():
-        candidate_warnings: List[str] = []
+        candidate_warnings: list[str] = []
 
         option_type = str(c.get("type", "")).upper().strip()
         strike = safe_float(c.get("strike"))
@@ -1200,9 +1200,8 @@ def evaluate_symbol(
             if net_premium_contract < rf_return:
                 continue
 
-            if enforce_sizing and max_position_capital is not None:
-                if capital_reserved > max_position_capital:
-                    continue
+            if enforce_sizing and max_position_capital is not None and capital_reserved > max_position_capital:
+                continue
 
         else:
             continue
@@ -1270,7 +1269,7 @@ def evaluate_symbol(
     if earnings_date is None:
         score += 5.0
     else:
-        days_to_earnings = (earnings_date - date.today()).days
+        days_to_earnings = (earnings_date - now_eastern_time.date()).days
         if days_to_earnings > 90:
             score += 10.0
         elif days_to_earnings > dte_max + earnings_buffer:
@@ -1321,7 +1320,7 @@ def evaluate_symbol(
 # portfolio-level sanity check, per Stage 32 of the rulebook.
 
 
-def evaluate_portfolio_stress(results: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
+def evaluate_portfolio_stress(results: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]:
     portfolio = cfg.get("portfolio", {}) or {}
 
     benchmark = portfolio.get("benchmark", "SPY")
@@ -1343,7 +1342,7 @@ def evaluate_portfolio_stress(results: List[Dict[str, Any]], cfg: Dict[str, Any]
     # to |delta| * 100 shares, weighted by the underlying's beta relative
     # to the benchmark. This is a rough aggregate, not a live Greeks feed.
     total_beta_weighted_delta_shares = 0.0
-    exposures: List[Dict[str, Any]] = []
+    exposures: list[dict[str, Any]] = []
 
     for r in authorized:
         delta = safe_float(r.get("delta"))
@@ -1378,7 +1377,7 @@ def evaluate_portfolio_stress(results: List[Dict[str, Any]], cfg: Dict[str, Any]
         approx_loss = total_beta_weighted_delta_shares * (shock_frac / 100.0)
         stress_results[f"{benchmark} {shock_pct:+g}%"] = round(approx_loss, 2)
 
-    regime_flags: List[str] = []
+    regime_flags: list[str] = []
     regime_state = "normal"
 
     if current_drawdown_pct >= regime_severe_drawdown:
@@ -1431,15 +1430,15 @@ def evaluate_portfolio_stress(results: List[Dict[str, Any]], cfg: Dict[str, Any]
 
 
 def write_report(
-    results: List[Dict[str, Any]],
-    cfg: Dict[str, Any],
-    portfolio_stress: Optional[Dict[str, Any]] = None,
-    batch_stats: Optional[Dict[str, Any]] = None,
+    results: list[dict[str, Any]],
+    cfg: dict[str, Any],
+    portfolio_stress: dict[str, Any] | None = None,
+    batch_stats: dict[str, Any] | None = None,
 ) -> None:
     report_dir = Path(cfg.get("report_dir", "reports"))
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = now_eastern_time.strftime("%Y%m%d_%H%M%S")
     csv_path = report_dir / f"actionable_report_{ts}.csv"
     md_path = report_dir / f"actionable_report_{ts}.md"
 
@@ -1449,10 +1448,10 @@ def write_report(
     df.to_csv(csv_path, index=False)
 
     # Markdown
-    lines: List[str] = []
+    lines: list[str] = []
     lines.append("# Options Trading Plan v3.5 — Actionable Report")
     lines.append("")
-    lines.append(f"Generated: {datetime.now().isoformat()}")
+    lines.append(f"Generated: {now_eastern_time.isoformat()}")
     lines.append("")
 
     if batch_stats:
@@ -1582,5 +1581,5 @@ def write_report(
 
     md_path.write_text("\n".join(lines), encoding="utf-8")
 
-    logging.info("Report written: %s", csv_path)
-    logging.info("Report written: %s", md_path)
+    log.info("Report written: %s", csv_path)
+    log.info("Report written: %s", md_path)

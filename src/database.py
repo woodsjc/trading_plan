@@ -1,12 +1,14 @@
 import logging
 import sqlite3
-from datetime import date
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import pandas as pd
 
 from parsing import parse_date, safe_float
+
+logger = logging.getLogger(__name__)
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -103,7 +105,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def save_underlying_rows(conn: sqlite3.Connection, underlying_rows: List[Dict[str, Any]]) -> None:
+def save_underlying_rows(conn: sqlite3.Connection, underlying_rows: list[dict[str, Any]]) -> None:
     if not underlying_rows:
         return
 
@@ -116,7 +118,7 @@ def save_underlying_rows(conn: sqlite3.Connection, underlying_rows: List[Dict[st
     conn.commit()
 
 
-def save_option_contracts(conn: sqlite3.Connection, contract_frames: List[pd.DataFrame]) -> None:
+def save_option_contracts(conn: sqlite3.Connection, contract_frames: list[pd.DataFrame]) -> None:
     if not contract_frames:
         return
 
@@ -146,7 +148,7 @@ def load_options_contracts(conn: sqlite3.Connection, symbol: str) -> pd.DataFram
     )
 
 
-def load_iv30_history(db_path: Path) -> Dict[str, "pd.Series"]:
+def load_iv30_history(db_path: Path) -> dict[str, pd.Series]:
     """
     Load the accrued iv_history table (never dropped between runs) into a
     per-symbol Series of past IV30 observations, used to compute a real
@@ -164,14 +166,17 @@ def load_iv30_history(db_path: Path) -> Dict[str, "pd.Series"]:
             df = pd.read_sql_query("SELECT symbol, date, iv30 FROM iv_history", conn)
         finally:
             conn.close()
-    except Exception as exc:
-        logging.info("No usable iv_history yet (%s) — will use RV proxy/manual override.", exc)
+    except sqlite3.Error as exc:
+        logger.info(
+            "No usable iv_history yet (%s) — will use RV proxy/manual override.",
+            exc,
+        )
         return {}
 
     if df.empty:
         return {}
 
-    out: Dict[str, pd.Series] = {}
+    out: dict[str, pd.Series] = {}
     for sym, group in df.groupby("symbol"):
         series = pd.to_numeric(group.sort_values("date")["iv30"], errors="coerce").dropna()
         if not series.empty:
@@ -180,7 +185,7 @@ def load_iv30_history(db_path: Path) -> Dict[str, "pd.Series"]:
     return out
 
 
-def upsert_iv_history(conn: sqlite3.Connection, underlying_rows: List[Dict[str, Any]]) -> None:
+def upsert_iv_history(conn: sqlite3.Connection, underlying_rows: list[dict[str, Any]]) -> None:
     """
     Append today's IV30/RV snapshot per symbol into the never-dropped
     iv_history table. INSERT OR REPLACE keyed on (symbol, date) makes this
@@ -196,7 +201,8 @@ def upsert_iv_history(conn: sqlite3.Connection, underlying_rows: List[Dict[str, 
             continue
 
         last_updated = u.get("last_updated")
-        d = parse_date(last_updated) or date.today()
+        parsed = parse_date(last_updated)
+        d = parsed or datetime.now(UTC).date()
 
         rows.append(
             (
@@ -220,4 +226,4 @@ def upsert_iv_history(conn: sqlite3.Connection, underlying_rows: List[Dict[str, 
         rows,
     )
     conn.commit()
-    logging.info("iv_history: upserted %s row(s) for today", len(rows))
+    logger.info("iv_history: upserted %s row(s) for today", len(rows))

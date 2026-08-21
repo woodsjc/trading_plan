@@ -13,8 +13,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "black>=24.0",
+    "pytest~=8.0",
+    "black~=24.0",
+    "ruff~=0.16.4",
 ]
 
 [build-system]
@@ -30,6 +31,13 @@ where = ["src"]
 [tool.black]
 line-length = 120
 target-version = ["py314"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.lint]
+ignore = ["BLE001"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
