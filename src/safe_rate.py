@@ -1,11 +1,15 @@
 import logging
 import os
-from datetime import date
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 
 from parsing import parse_date
+
+log = logging.getLogger(__name__)
+now_eastern_time = datetime.now(ZoneInfo("America/New_York"))
 
 
 def get_fred_rate(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -44,13 +48,13 @@ def get_fred_rate(cfg: dict[str, Any]) -> dict[str, Any]:
                     }
 
         except Exception as exc:
-            logging.warning("FRED API failed: %s", exc)
+            log.warning("FRED API failed: %s", exc)
 
     if cfg.get("allow_default_rf_rate", True) and default_rate is not None:
         asof = parse_date(cfg.get("default_rf_rate_asof"))
         if asof is not None:
-            stale_days = (date.today() - asof).days
-            logging.warning(
+            stale_days = (now_eastern_time.date() - asof).days
+            log.warning(
                 "Using static default_rf_rate=%.4f (config_default), last reviewed %s "
                 "(%s days ago). Stage 8's risk-free hurdle depends on this being current "
                 "— set FRED_API_KEY or refresh default_rf_rate_asof.",
@@ -59,7 +63,7 @@ def get_fred_rate(cfg: dict[str, Any]) -> dict[str, Any]:
                 stale_days,
             )
         else:
-            logging.warning(
+            log.warning(
                 "Using static default_rf_rate=%.4f (config_default) with no "
                 "default_rf_rate_asof set — staleness cannot be assessed.",
                 float(default_rate),

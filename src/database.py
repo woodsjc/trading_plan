@@ -1,12 +1,14 @@
 import logging
 import sqlite3
-from datetime import date
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from parsing import parse_date, safe_float
+
+logger = logging.getLogger(__name__)
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -164,8 +166,11 @@ def load_iv30_history(db_path: Path) -> dict[str, pd.Series]:
             df = pd.read_sql_query("SELECT symbol, date, iv30 FROM iv_history", conn)
         finally:
             conn.close()
-    except Exception as exc:
-        logging.info("No usable iv_history yet (%s) — will use RV proxy/manual override.", exc)
+    except sqlite3.Error as exc:
+        logger.info(
+            "No usable iv_history yet (%s) — will use RV proxy/manual override.",
+            exc,
+        )
         return {}
 
     if df.empty:
@@ -196,7 +201,8 @@ def upsert_iv_history(conn: sqlite3.Connection, underlying_rows: list[dict[str, 
             continue
 
         last_updated = u.get("last_updated")
-        d = parse_date(last_updated) or date.today()
+        parsed = parse_date(last_updated)
+        d = parsed or datetime.now(UTC).date()
 
         rows.append(
             (
@@ -220,4 +226,4 @@ def upsert_iv_history(conn: sqlite3.Connection, underlying_rows: list[dict[str, 
         rows,
     )
     conn.commit()
-    logging.info("iv_history: upserted %s row(s) for today", len(rows))
+    logger.info("iv_history: upserted %s row(s) for today", len(rows))

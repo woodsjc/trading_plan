@@ -5,6 +5,7 @@ import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,9 @@ import yfinance as yf
 
 from database import load_options_contracts, load_underlying_metrics
 from parsing import parse_date, safe_float
+
+log = logging.getLogger(__name__)
+now_eastern_time = datetime.now(ZoneInfo("America/New_York"))
 
 
 def call_with_backoff(
@@ -37,13 +41,13 @@ def call_with_backoff(
     while attempt <= max_retries:
         try:
             return fn(*args, **kwargs)
-        except Exception as exc:  # noqa: BLE001 - deliberately broad, this wraps 3rd-party calls
+        except Exception as exc:
             last_exc = exc
             attempt += 1
             if attempt > max_retries:
                 break
             delay = base_delay * (2 ** (attempt - 1))
-            logging.warning(
+            log.warning(
                 "%s failed (attempt %s/%s): %s — retrying in %.1fs",
                 label or getattr(fn, "__name__", "call"),
                 attempt,
@@ -53,7 +57,7 @@ def call_with_backoff(
             )
             time.sleep(delay)
 
-    logging.error(
+    log.error(
         "%s failed after %s attempts: %s",
         label or getattr(fn, "__name__", "call"),
         max_retries,
@@ -127,7 +131,7 @@ def fetch_price_history(
     if not symbols:
         return out
 
-    logging.info("Downloading batch price history for %s symbols", len(symbols))
+    log.info("Downloading batch price history for %s symbols", len(symbols))
 
     try:
         data = call_with_backoff(
@@ -144,11 +148,11 @@ def fetch_price_history(
             label="yf.download(batch price history)",
         )
     except Exception as exc:
-        logging.error("yf.download failed after retries: %s", exc)
+        log.error("yf.download failed after retries: %s", exc)
         return out
 
     if data is None or data.empty:
-        logging.warning("Price history download returned empty data")
+        log.warning("Price history download returned empty data")
         return out
 
     for sym in symbols:
@@ -201,7 +205,7 @@ def fetch_price_history(
             }
 
         except Exception as exc:
-            logging.warning("Price history failed for %s: %s", sym, exc)
+            log.warning("Price history failed for %s: %s", sym, exc)
 
     return out
 
@@ -252,20 +256,20 @@ def get_earnings_date(tk: yf.Ticker, info: dict[str, Any]) -> date | None:
                     if parsed:
                         candidates.append(parsed)
 
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Caught error: {e}")
 
     try:
         earnings_dates = tk.earnings_dates
         if earnings_dates is not None and not earnings_dates.empty:
             for idx in earnings_dates.index:
                 parsed = parse_date(idx)
-                if parsed and parsed >= date.today() - timedelta(days=1):
+                if parsed and parsed >= now_eastern_time.date() - timedelta(days=1):
                     candidates.append(parsed)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"Caught error: {e}")
 
-    future = [d for d in candidates if d and d >= date.today() - timedelta(days=1)]
+    future = [d for d in candidates if d and d >= now_eastern_time.date() - timedelta(days=1)]
     return min(future) if future else None
 
 
@@ -309,7 +313,7 @@ def get_next_dividend_amount(
                     "estimated": False,
                 }
     except Exception as exc:
-        logging.warning("tk.dividends failed: %s", exc)
+        log.warning("tk.dividends failed: %s", exc)
 
     annual_rate = safe_float(info.get("dividendRate")) or safe_float(info.get("trailingAnnualDividendRate"))
     if annual_rate is not None and annual_rate > 0:
@@ -344,7 +348,7 @@ def fetch_fundamentals(
             label=f"tk.info({symbol})",
         )
     except Exception as exc:
-        logging.warning("Info failed for %s after retries: %s", symbol, exc)
+        log.warning("Info failed for %s after retries: %s", symbol, exc)
 
     price = info.get("regularMarketPrice") or info.get("currentPrice") or info.get("previousClose")
 
@@ -406,17 +410,17 @@ def fetch_options_chain(
             label=f"tk.options({symbol})",
         )
     except Exception as exc:
-        logging.warning("Options expirations failed for %s after retries: %s", symbol, exc)
+        log.warning("Options expirations failed for %s after retries: %s", symbol, exc)
         return pd.DataFrame(rows)
 
     if not expirations:
         return pd.DataFrame(rows)
 
-    today = date.today()
+    today = now_eastern_time.date()
     min_dte_fetch = int(cfg.get("min_dte_fetch", 30))
     max_dte_fetch = int(cfg.get("max_dte_fetch", 40))
     rf_for_delta = rf_rate if rf_rate is not None else 0.0
-    now_iso = datetime.now().isoformat()
+    now_iso = now_eastern_time.isoformat()
 
     # Raw rows are collected first and the IV-rescale decision is made once
     # per symbol (see below) rather than per-contract. A per-contract
@@ -432,8 +436,9 @@ def fetch_options_chain(
 
     for exp in expirations:
         try:
-            exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
-        except Exception:
+            exp_date = datetime.strptime(exp, "%Y-%m-%d").replace(tzinfo=ZoneInfo("America/New_York")).date()
+        except Exception as e:
+            log.warning(f"Continuing on error: {e}")
             continue
 
         dte = (exp_date - today).days
@@ -449,7 +454,7 @@ def fetch_options_chain(
                 label=f"tk.option_chain({symbol}, {exp})",
             )
         except Exception as exc:
-            logging.warning("Option chain failed for %s %s after retries: %s", symbol, exp, exc)
+            log.warning("Option chain failed for %s %s after retries: %s", symbol, exp, exc)
             continue
 
         datasets = [
@@ -527,7 +532,7 @@ def fetch_options_chain(
         chain_needs_rescale = frac_over_threshold >= rescale_majority_frac
 
     if chain_needs_rescale:
-        logging.info(
+        log.info(
             "IV rescale applied at chain level: %s — %d/%d valid IV prints > %.1f, dividing whole chain by 100",
             symbol,
             sum(1 for v in raw_ivs if v > rescale_threshold),
@@ -616,7 +621,7 @@ def load_iv_rank_overrides(path: str) -> dict[str, float | None]:
         return out
 
     except Exception as exc:
-        logging.warning("Could not load IV Rank overrides: %s", exc)
+        log.warning("Could not load IV Rank overrides: %s", exc)
         return {}
 
 
@@ -678,7 +683,7 @@ def get_iv_rank(
             else:
                 # No variation in the historical window (e.g. all identical
                 # observations) — min/max IV Rank is undefined, not 0 or 100.
-                logging.warning(
+                log.warning(
                     "%s: historical IV window has zero range (min=max=%.4f) over %s obs — "
                     "IV Rank cannot be computed from this window",
                     symbol,
@@ -720,7 +725,7 @@ def get_iv_rank(
 
 
 def empty_underlying(symbol: str, notes: str, rf_meta: dict[str, Any]) -> dict[str, Any]:
-    now_iso = datetime.now().isoformat()
+    now_iso = now_eastern_time.isoformat()
 
     return {
         "symbol": symbol,
@@ -804,7 +809,7 @@ def process_symbol(
 
         underlying = {
             "symbol": symbol,
-            "last_updated": datetime.now().isoformat(),
+            "last_updated": now_eastern_time.isoformat(),
             "price": spot,
             "average_volume": fund.get("average_volume"),
             "market_cap": fund.get("market_cap"),
@@ -834,7 +839,7 @@ def process_symbol(
         }
 
     except Exception as exc:
-        logging.exception("process_symbol failed for %s", symbol)
+        log.exception("process_symbol failed for %s", symbol)
         return {
             "underlying": empty_underlying(symbol, f"process_symbol exception: {exc}", rf_meta),
             "options": pd.DataFrame(),
@@ -957,7 +962,7 @@ def evaluate_symbol(
 
     try:
         last_updated_dt = datetime.fromisoformat(str(last_updated_raw))
-        age_hours = (datetime.now() - last_updated_dt).total_seconds() / 3600.0
+        age_hours = (now_eastern_time - last_updated_dt).total_seconds() / 3600.0
 
         if age_hours > max_data_age_hours:
             msg = f"Stage 0: data is {age_hours:.1f}h old, exceeds max_data_age_hours={max_data_age_hours}"
@@ -1032,7 +1037,7 @@ def evaluate_symbol(
     earnings_buffer = safe_float(screen.get("earnings_buffer_days", 7)) or 7.0
 
     if earnings_date is not None:
-        days_to_earnings = (earnings_date - date.today()).days
+        days_to_earnings = (earnings_date - now_eastern_time.date()).days
 
         if 0 <= days_to_earnings <= dte_max + earnings_buffer:
             return reject(f"Stage 3: earnings in {days_to_earnings} days, inside standard option life")
@@ -1195,9 +1200,8 @@ def evaluate_symbol(
             if net_premium_contract < rf_return:
                 continue
 
-            if enforce_sizing and max_position_capital is not None:
-                if capital_reserved > max_position_capital:
-                    continue
+            if enforce_sizing and max_position_capital is not None and capital_reserved > max_position_capital:
+                continue
 
         else:
             continue
@@ -1265,7 +1269,7 @@ def evaluate_symbol(
     if earnings_date is None:
         score += 5.0
     else:
-        days_to_earnings = (earnings_date - date.today()).days
+        days_to_earnings = (earnings_date - now_eastern_time.date()).days
         if days_to_earnings > 90:
             score += 10.0
         elif days_to_earnings > dte_max + earnings_buffer:
@@ -1434,7 +1438,7 @@ def write_report(
     report_dir = Path(cfg.get("report_dir", "reports"))
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = now_eastern_time.strftime("%Y%m%d_%H%M%S")
     csv_path = report_dir / f"actionable_report_{ts}.csv"
     md_path = report_dir / f"actionable_report_{ts}.md"
 
@@ -1447,7 +1451,7 @@ def write_report(
     lines: list[str] = []
     lines.append("# Options Trading Plan v3.5 — Actionable Report")
     lines.append("")
-    lines.append(f"Generated: {datetime.now().isoformat()}")
+    lines.append(f"Generated: {now_eastern_time.isoformat()}")
     lines.append("")
 
     if batch_stats:
@@ -1577,5 +1581,5 @@ def write_report(
 
     md_path.write_text("\n".join(lines), encoding="utf-8")
 
-    logging.info("Report written: %s", csv_path)
-    logging.info("Report written: %s", md_path)
+    log.info("Report written: %s", csv_path)
+    log.info("Report written: %s", md_path)

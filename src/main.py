@@ -7,13 +7,7 @@ from typing import Any
 import pandas as pd
 
 from config import CONFIG
-from database import (
-    connect,
-    load_iv30_history,
-    save_option_contracts,
-    save_underlying_rows,
-    upsert_iv_history,
-)
+from database import connect, load_iv30_history, save_option_contracts, save_underlying_rows, upsert_iv_history
 from options_plan import (
     base_result,
     evaluate_portfolio_stress,
@@ -33,17 +27,18 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    log = logging.getLogger(__name__)
 
     config = CONFIG
     symbols = load_symbols(config)
     if not symbols:
-        logging.error("No symbols found. Add symbols to config.py or universe.csv.")
+        log.error("No symbols found. Add symbols to config.py or universe.csv.")
         sys.exit(1)
 
-    logging.info("Universe size: %s", len(symbols))
+    log.info("Universe size: %s", len(symbols))
 
     rf_meta = get_fred_rate(config)
-    logging.info(
+    log.info(
         "Risk-free rate: %s source=%s estimated=%s",
         rf_meta.get("rate"),
         rf_meta.get("source"),
@@ -64,7 +59,7 @@ def main():
 
     db_path = Path(config.get("database_path", "options_v33.db"))
     iv30_history_map = load_iv30_history(db_path)
-    logging.info(
+    log.info(
         "Loaded iv_history for %s symbol(s); min_iv_history_days=%s",
         len(iv30_history_map),
         config.get("min_iv_history_days", 100),
@@ -104,8 +99,8 @@ def main():
                 if options is not None and not options.empty:
                     contract_frames.append(options)
 
-            except Exception as exc:
-                logging.exception("Future failed for %s: %s", symbol, exc)
+            except Exception as e:
+                log.error(f"Future failed for {symbol}: {e}")
 
     # Batch completeness check: a low fraction of symbols returning a
     # usable options chain is a signal of rate limiting / partial outage
@@ -124,7 +119,7 @@ def main():
     }
 
     if degraded:
-        logging.warning(
+        log.warning(
             "Batch completeness %.1f%% is below min_batch_completeness_pct=%.1f%% "
             "(%s/%s symbols returned a usable options chain). This run may be "
             "degraded by rate limiting or a partial data outage — treat REJECT/"
@@ -135,7 +130,7 @@ def main():
             len(symbols),
         )
     else:
-        logging.info(
+        log.info(
             "Batch completeness OK: %.1f%% (%s/%s symbols)",
             completeness_pct,
             symbols_with_options,
@@ -156,7 +151,7 @@ def main():
             res = evaluate_symbol(symbol, config, conn)
             results.append(res)
         except Exception as exc:
-            logging.exception("Evaluation failed for %s", symbol)
+            log.exception("Evaluation failed for %s", symbol)
             r = base_result(symbol)
             r["reasons"].append(f"Evaluation exception: {exc}")
             results.append(r)
@@ -164,17 +159,15 @@ def main():
     portfolio_stress = evaluate_portfolio_stress(results, config)
 
     if portfolio_stress.get("regime_state") != "normal":
-        logging.warning(
+        log.warning(
             "Portfolio regime state: %s — %s",
             portfolio_stress.get("regime_state"),
             "; ".join(portfolio_stress.get("regime_flags", [])),
         )
 
     write_report(results, config, portfolio_stress=portfolio_stress, batch_stats=batch_stats)
-
     conn.close()
-
-    logging.info("Done.")
+    log.info("Done.")
 
 
 if __name__ == "__main__":
