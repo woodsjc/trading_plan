@@ -23,7 +23,7 @@ def parse_date(value: Any) -> date | None:
         if ts > 1e12:
             ts = ts / 1000.0
         try:
-            return datetime.fromtimestamp(ts).replace(tzinfo=ZoneInfo("America/New_York")).date()
+            return datetime.fromtimestamp(ts, tz=ZoneInfo("America/New_York")).date()
         except Exception:
             return None
 
