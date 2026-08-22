@@ -34,6 +34,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             price REAL,
             average_volume REAL,
             market_cap REAL,
+            market_cap_source TEXT,
             beta REAL,
             earnings_date TEXT,
             ex_div_date TEXT,

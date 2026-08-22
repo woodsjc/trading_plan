@@ -51,6 +51,9 @@ Here is exactly how the collected data satisfies the hard gates of the v3.5 plan
 ### Stage 1: Underlying Screen
 *   **Data Used:** Market Cap, Beta, Earnings Date, Dividend Date, Current Price.
 *   **Logic:** Filter out if `Earnings Date` is within the next 60 days. Filter out if `Dividend Date` is within the option life.
+*   **Market cap source (corrected):** `info["marketCap"]` is not populated by yfinance for ETFs/funds (there's no share-count × price calculation for a fund the way there is for a company). Without a fallback, every ETF fails Stage 1 with "unavailable" regardless of actual size or liquidity — even though Stage 26 of the rulebook explicitly expects ETFs to be tradeable. The corrected source order is:
+    1. `info["marketCap"]` for equities.
+    2. Fallback to `info["totalAssets"]` (AUM) when `marketCap` is `None` — the standard size proxy for a fund. Stored with `market_cap_source = "totalAssets_etf_proxy"` so it's visible in the report which figure was actually used.
 
 ### Stage 2: Volatility Screen (The Core Edge)
 *   **Data Used:** IV30, IV Rank, RV_20D, RV_30D.
@@ -74,6 +77,7 @@ Here is exactly how the collected data satisfies the hard gates of the v3.5 plan
     *   Filter for `Daily_Volume >= 10` (Hard Gate).
     *   Calculate `Spread = Ask - Bid`. If `Spread / Midpoint > 0.10`, trigger `🔴 REJECT` (Hard Gate).
 *   **IV normalization (corrected):** Yahoo occasionally returns IV in whole-percent form (e.g. `35.0` instead of `0.35`) for a given chain. The rescale decision (`÷100`) is made **once per symbol, at the chain level**, based on whether a majority (default 50%, configurable via `iv_rescale_majority_frac`) of that chain's valid non-null IV prints exceed `iv_rescale_threshold` (default `3.0`). A prior per-contract version rescaled any single contract with `iv > 3.0` in isolation — but a legitimately high-IV deep-OTM, small-cap, or event-driven contract can print IV > 300% for real, and the per-contract heuristic would silently corrupt that single strike's IV (and everything downstream: delta, extrinsic value, IV30, VRP) while leaving the rest of the chain untouched. Deciding at the chain level avoids punishing genuine outliers while still catching systemic units bugs. Every chain-level rescale is logged at INFO with the affected/total IV counts for audit.
+*   **Missing-IV → missing-delta funnel (new finding):** `delta` is *derived* from `iv` via `bs_delta()` — if Yahoo doesn't return `impliedVolatility` for a given contract (common even for contracts with a perfectly tradeable bid/ask), that contract's `delta` silently becomes `None`, and it will then fail the `abs_delta.between(delta_min, delta_max)` filter regardless of how good its OI/volume/spread are. In practice this can make `options_contracts` hold thousands of rows with real, tradeable quotes while Stage 4/5 rejects a symbol with an opaque "no contract satisfies gates" message. The pipeline now logs, per symbol, how many quoted (valid bid/ask) contracts had no usable IV, and — when a symbol is rejected at Stage 4/5 — the report's `reasons` field includes an independent per-gate pass-count funnel (how many contracts passed DTE window, OI, volume, spread, "has IV", "has computed delta", and delta-in-range, respectively) instead of a single opaque message. This makes it possible to see directly whether OI/volume/spread or missing-IV/delta is the actual bottleneck for a given symbol/run, without a manual SQL query.
 
 ### Stage 6: Premium Sufficiency
 *   **Data Used:** Midpoint premium, Bid/Ask spread.
@@ -106,7 +110,8 @@ Here is exactly how the collected data satisfies the hard gates of the v3.5 plan
 | `last_updated` | TIMESTAMP | Stage 0 |
 | `price` | FLOAT | Stage 1 |
 | `beta` | FLOAT | Stage 10 |
-| `market_cap` | BIGINT | Stage 1 |
+| `market_cap` | BIGINT | Stage 1 — equities use `marketCap`; ETFs/funds fall back to `totalAssets` (see Stage 1 above) |
+| `market_cap_source` | VARCHAR | Stage 1 — `marketCap` / `totalAssets_etf_proxy` / `missing` |
 | `earnings_date` | DATE | Stage 3 |
 | `ex_div_date` | DATE | Stage 9 |
 | `div_amount` | FLOAT | Stage 9 — **single-payment estimate**, not annualized (see Stage 9 above) |
@@ -135,8 +140,8 @@ Here is exactly how the collected data satisfies the hard gates of the v3.5 plan
 | `bid` | FLOAT | Stage 5 |
 | `ask` | FLOAT | Stage 5 |
 | `midpoint` | FLOAT | Stage 6 |
-| `delta` | FLOAT | Stage 4 — model-derived (Black-Scholes from quoted IV); expect divergence from a broker's live Greeks feed, especially for dividend payers, since this model has no dividend-yield adjustment |
-| `iv` | FLOAT | Stage 4 — chain-level-rescale-corrected (see Stage 4/5 above) |
+| `delta` | FLOAT | Stage 4 — model-derived (Black-Scholes from quoted IV); expect divergence from a broker's live Greeks feed, especially for dividend payers, since this model has no dividend-yield adjustment. **Depends entirely on `iv` being non-null** — see the Stage 4/5 missing-IV note above; a row can have a perfectly valid bid/ask and still carry a null `delta`. |
+| `iv` | FLOAT | Stage 4 — chain-level-rescale-corrected (see Stage 4/5 above). Frequently `NULL` even for quoted, tradeable contracts, since Yahoo does not always return `impliedVolatility` per-strike. |
 | `open_interest` | INT | Stage 5 |
 | `volume` | INT | Stage 5 |
 | `extrinsic_value`| FLOAT | Stage 9 |
@@ -198,6 +203,9 @@ def run_v3_plan(symbol):
     **Do not conflate IV Rank and IV Percentile.** Use the min/max formula for any field named `iv_rank`; if a percentile-style measure is wanted, name and document it separately as `iv_percentile`.
     **Use a single-payment dividend amount, not an annualized rate**, for the Stage 9/31 extrinsic-vs-dividend assignment-risk check.
     **Decide IV rescaling (`÷100`) at the chain level, not per-contract**, so genuinely high-IV individual contracts aren't silently corrupted.
+    **Give ETFs/funds a `totalAssets` fallback for market cap**, or Stage 1 will reject every fund regardless of size/liquidity.
+    **Write diagnostic (`market_cap`, `average_volume`, `iv_rank`, `vrp_ratio`, `beta`, `price`) fields to the report row as soon as they're computed**, not only after all gates for that stage have already passed — otherwise a rejected symbol's report row looks identical whether the underlying value was missing or simply below threshold, which defeats the purpose of the reasons column.
+    **When a liquidity-gate rejection (Stage 4/5) fires, report the per-gate funnel counts**, not just "no contract satisfies gates" — a symbol can have hundreds of contracts with valid bid/ask that are excluded purely because `iv`/`delta` came back null from the data source, and that's indistinguishable from genuinely thin OI/volume/spread without the breakdown.
 
 ## 8. Known Fixes Log
 
@@ -207,3 +215,8 @@ def run_v3_plan(symbol):
 | (this review) | Dividend amount used for Stage 9/31 assignment-risk was sourced from `dividendRate`/`trailingAnnualDividendRate` (annualized), overstating the relevant single-payment dividend by roughly the payment frequency (~4x for quarterly payers). | Added `get_next_dividend_amount()`, preferring the last actual payment from `ticker.dividends`, falling back to `annual_rate / 4` only when history is unavailable, with source/estimated flags stored and surfaced as a candidate warning. |
 | (this review) | `get_iv_rank()` computed `mean(history < iv_today) * 100`, which is IV **Percentile**, not IV **Rank** — despite being stored in a field named `iv_rank` and gated against IV-Rank-style thresholds. Can diverge sharply from a brokerage's displayed IV Rank. | Changed the historical-IV branch to the standard min/max IV Rank formula: `(iv_today - hist.min()) / (hist.max() - hist.min()) * 100`. |
 | (this review) | `fetch_options_chain()` rescaled any individual contract's IV (`÷100`) whenever it read `> 3.0`, which can silently corrupt legitimately high-IV deep-OTM/small-cap/event-driven contracts. | Rescale decision now made once per symbol at the chain level, based on whether a majority of that chain's valid IV prints exceed the threshold. |
+| (latest review) | `fetch_fundamentals()` only read `info["marketCap"]`, which yfinance does not populate for ETFs/funds. Every ETF (QQQ, SPY, IWM in a sample run) failed Stage 1 with "market cap ... unavailable" regardless of actual size or liquidity, contradicting Stage 26's expectation that diversified ETFs are tradeable. | Added a `totalAssets` (AUM) fallback when `marketCap` is `None`, with `market_cap_source` stored (`marketCap` / `totalAssets_etf_proxy` / `missing`) so the report shows which figure was used. New `underlying_metrics.market_cap_source` column. |
+| (latest review) | `evaluate_symbol()` only wrote `iv_rank`, `vrp_ratio`, `beta`, and `price` into the report row *after* the Stage 1/2 gates that could reject the symbol had already returned — and never wrote `market_cap`/`average_volume` at all. A sample run showed 14/22 symbols with every diagnostic field blank in the CSV despite the underlying values already being in the DB, making it impossible to tell "value missing" from "value below threshold" from the report alone. | Diagnostic fields (`market_cap`, `average_volume`, `beta`, `price`, `iv_rank`, `vrp_ratio`) are now written to `result` immediately after each is computed, before any gate check that could `return` early. `market_cap`/`average_volume` added to `base_result()`/the report schema. |
+| (latest review) | Stage 4/5 liquidity rejection ("no contract satisfies DTE/delta/OI/volume/spread gates") gave no visibility into *which* filter was actually excluding contracts. In practice `delta` is derived from `iv` (`bs_delta`), and Yahoo frequently omits `impliedVolatility` for contracts that otherwise have a perfectly valid bid/ask — so a symbol with thousands of tradeable-looking rows in `options_contracts` can still reject with zero passing contracts purely because `iv`/`delta` came back null, indistinguishable in the old message from genuinely thin OI/volume/spread. | `evaluate_symbol()` now computes independent per-gate pass counts (DTE window, OI, volume, spread, has-IV, has-computed-delta, delta-in-range) and includes them in the rejection reason when `valid` is empty. `fetch_options_chain()` also logs, per symbol, how many quoted (bid/ask-valid) contracts had no usable IV. |
+| (latest review) | The markdown actionable report (`actionable_report_<ts>.md`) duplicated the CSV's content in a heavier, harder-to-diff format and was not being used downstream. | `write_report()` now writes CSV only. `batch_stats`/`portfolio_stress` are still computed and logged in `main.py`; they are no longer rendered to markdown. |
+| (latest review) | There was no way to inspect the full raw `underlying_metrics` table (as collected, independent of the Stage 0-7 gate/report logic) without a manual `sqlite3` query. | Added `write_underlying_metrics_dump()`, called from `main.py` after the DB write, producing `reports/temp_underlying_metrics_<ts>.csv` — a straight `SELECT * FROM underlying_metrics` dump (Python equivalent of `sqlite3 -csv -header options_info.db "select * from underlying_metrics;"`). |
