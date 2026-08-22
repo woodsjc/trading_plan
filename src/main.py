@@ -16,6 +16,7 @@ from options_plan import (
     load_iv_rank_overrides,
     process_symbol,
     write_report,
+    write_underlying_metrics_dump,
 )
 from parsing import safe_float
 from safe_rate import get_fred_rate
@@ -165,7 +166,16 @@ def main():
             "; ".join(portfolio_stress.get("regime_flags", [])),
         )
 
+    # NOTE: write_report now emits CSV only (the markdown report was
+    # removed by request). batch_stats/portfolio_stress are still
+    # computed above and logged, just no longer rendered to markdown.
     write_report(results, config, portfolio_stress=portfolio_stress, batch_stats=batch_stats)
+
+    # Raw table dump of underlying_metrics for this run, independent of
+    # the Stage 0-7 gate logic — the Python equivalent of:
+    #   sqlite3 -csv -header options_info.db "select * from underlying_metrics;"
+    write_underlying_metrics_dump(config, conn)
+
     conn.close()
     log.info("Done.")
 

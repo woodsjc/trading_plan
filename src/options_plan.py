@@ -355,6 +355,19 @@ def fetch_fundamentals(
     avg_volume = info.get("averageVolume") or info.get("averageDailyVolume10Day") or info.get("volume")
 
     market_cap = info.get("marketCap")
+    market_cap_source = "marketCap"
+
+    if market_cap is None:
+        # ETFs/funds do not populate `marketCap` in yfinance's `info` dict
+        # (there is no share-count x price calculation for a fund the way
+        # there is for a company). Without this fallback, every ETF fails
+        # Stage 1's market-cap gate with "unavailable" regardless of size
+        # or liquidity, even though Stage 26 of the rulebook explicitly
+        # expects ETFs to be tradeable. `totalAssets` (AUM) is the
+        # standard size proxy for a fund.
+        market_cap = info.get("totalAssets")
+        market_cap_source = "totalAssets_etf_proxy" if market_cap is not None else "missing"
+
     beta = info.get("beta")
 
     dividend_data = get_next_dividend_amount(
@@ -371,6 +384,7 @@ def fetch_fundamentals(
         "price": safe_float(price),
         "average_volume": safe_float(avg_volume),
         "market_cap": safe_float(market_cap),
+        "market_cap_source": market_cap_source,
         "beta": safe_float(beta),
         "dividend_amount": dividend_data["amount"],
         "dividend_amount_source": dividend_data["source"],
@@ -538,6 +552,23 @@ def fetch_options_chain(
             sum(1 for v in raw_ivs if v > rescale_threshold),
             len(raw_ivs),
             rescale_threshold,
+        )
+
+    # Diagnostic: how many raw (bid/ask-valid) rows had no usable IV at
+    # all from Yahoo. This is the leading suspect when options_contracts
+    # has plenty of bid/ask rows but Stage 4/5 still rejects everything —
+    # delta is derived from iv (see bs_delta), so a missing iv silently
+    # becomes a missing delta, which then fails the delta-range filter
+    # even though the contract itself had a tradeable quote.
+    n_missing_iv = sum(1 for r in raw_rows if r.get("iv_raw") is None)
+    if n_missing_iv:
+        log.info(
+            "%s: %d/%d quoted contracts (valid bid/ask) had no impliedVolatility from Yahoo "
+            "-> delta cannot be computed for those rows and they will be excluded from any "
+            "delta-range-filtered candidate list downstream.",
+            symbol,
+            n_missing_iv,
+            len(raw_rows),
         )
 
     t_years_cache: dict[int, float] = {}
@@ -733,6 +764,7 @@ def empty_underlying(symbol: str, notes: str, rf_meta: dict[str, Any]) -> dict[s
         "price": None,
         "average_volume": None,
         "market_cap": None,
+        "market_cap_source": "missing",
         "beta": None,
         "earnings_date": None,
         "ex_div_date": None,
@@ -813,6 +845,7 @@ def process_symbol(
             "price": spot,
             "average_volume": fund.get("average_volume"),
             "market_cap": fund.get("market_cap"),
+            "market_cap_source": fund.get("market_cap_source"),
             "beta": fund.get("beta"),
             "earnings_date": (fund.get("earnings_date").isoformat() if fund.get("earnings_date") else None),
             "ex_div_date": (fund.get("ex_div_date").isoformat() if fund.get("ex_div_date") else None),
@@ -872,6 +905,8 @@ def base_result(symbol: str) -> dict[str, Any]:
         "score": None,
         "beta": None,
         "price": None,
+        "market_cap": None,
+        "average_volume": None,
         "reasons": [],
     }
 
@@ -986,11 +1021,25 @@ def evaluate_symbol(
     avg_volume = safe_float(u.get("average_volume"))
     beta = safe_float(u.get("beta"))
 
+    # NOTE: these are written into `result` immediately, before any gate
+    # check below can `return` early. Previously these fields (plus
+    # iv_rank/vrp_ratio further down) were only assigned to `result` after
+    # ALL Stage 1/2 gates had already passed, so any symbol rejected at
+    # Stage 1 or Stage 2 showed blank market_cap/avg_volume/beta/price/
+    # iv_rank/vrp_ratio in the report even though the underlying data was
+    # already sitting in the DB — making it impossible to tell from the
+    # report whether e.g. "market cap ... unavailable" meant a real
+    # too-small value or a missing fetch.
+    result["beta"] = beta
+    result["price"] = safe_float(u.get("price"))
+    result["market_cap"] = market_cap
+    result["average_volume"] = avg_volume
+
     min_market_cap = safe_float(screen.get("min_market_cap", 0)) or 0.0
     min_avg_volume = safe_float(screen.get("min_avg_volume", 0)) or 0.0
 
     if market_cap is None or market_cap < min_market_cap:
-        return reject("Stage 1: market cap below minimum or unavailable")
+        return reject("Stage 1: market cap (or ETF totalAssets proxy) below minimum or unavailable")
 
     if avg_volume is None or avg_volume < min_avg_volume:
         return reject("Stage 1: average volume below minimum or unavailable")
@@ -1008,6 +1057,9 @@ def evaluate_symbol(
     rv30 = safe_float(u.get("rv30d"))
     vrp_ratio = safe_float(u.get("vrp_ratio"))
 
+    result["iv_rank"] = iv_rank
+    result["vrp_ratio"] = vrp_ratio
+
     iv_rank_min = safe_float(screen.get("iv_rank_min", 30.0)) or 30.0
     vrp_ratio_min = safe_float(screen.get("vrp_ratio_min", 1.05)) or 1.05
 
@@ -1022,11 +1074,6 @@ def evaluate_symbol(
 
     if rv20 is not None and iv30 <= rv20:
         warnings.append("Stage 2: IV30 <= RV20D, multi-horizon VRP confirmation is weak")
-
-    result["iv_rank"] = iv_rank
-    result["vrp_ratio"] = vrp_ratio
-    result["beta"] = beta
-    result["price"] = safe_float(u.get("price"))
 
     # ------------------------------------------------------------------
     # Stage 3: catalyst / earnings screen
@@ -1083,17 +1130,46 @@ def evaluate_symbol(
     max_spread_pct = safe_float(screen.get("max_spread_pct", 0.10)) or 0.10
     min_premium_cost_ratio = safe_float(screen.get("min_premium_cost_ratio", 5.0)) or 5.0
 
-    valid = contracts_df[
-        contracts_df["dte"].between(dte_min, dte_max)
-        & (contracts_df["open_interest"].fillna(0) >= min_open_interest)
-        & (contracts_df["volume"].fillna(0) >= min_volume)
-        & contracts_df["spread_pct"].notna()
-        & (contracts_df["spread_pct"] <= max_spread_pct)
-        & contracts_df["abs_delta"].between(delta_min, delta_max)
+    dte_window = contracts_df[contracts_df["dte"].between(dte_min, dte_max)]
+
+    valid = dte_window[
+        (dte_window["open_interest"].fillna(0) >= min_open_interest)
+        & (dte_window["volume"].fillna(0) >= min_volume)
+        & dte_window["spread_pct"].notna()
+        & (dte_window["spread_pct"] <= max_spread_pct)
+        & dte_window["abs_delta"].between(delta_min, delta_max)
     ].copy()
 
     if valid.empty:
-        return reject("Stage 4/5: no contract satisfies DTE/delta/OI/volume/spread gates")
+        # Diagnostic funnel: options_contracts can hold many rows with
+        # real, tradeable bid/ask quotes that still get excluded here.
+        # The filter above is a single combined AND, so a symbol can
+        # have e.g. 400 contracts with fine OI/volume/spread and still
+        # show "no contract satisfies gates" if `delta` (and therefore
+        # `abs_delta`) is null for all of them. Since delta is *derived*
+        # from `iv` (see bs_delta / fetch_options_chain), a missing
+        # impliedVolatility from Yahoo silently becomes a missing delta,
+        # which fails `abs_delta.between(...)` even though the contract
+        # itself was perfectly tradeable. Report independent per-gate
+        # pass counts (not sequential) so the actual bottleneck is
+        # visible in the report instead of a single opaque rejection.
+        n_dte = len(dte_window)
+        n_oi = int((dte_window["open_interest"].fillna(0) >= min_open_interest).sum())
+        n_vol = int((dte_window["volume"].fillna(0) >= min_volume).sum())
+        n_spread = int((dte_window["spread_pct"].notna() & (dte_window["spread_pct"] <= max_spread_pct)).sum())
+        n_iv = int(dte_window["iv"].notna().sum())
+        n_delta_computed = int(dte_window["abs_delta"].notna().sum())
+        n_delta_range = int(dte_window["abs_delta"].between(delta_min, delta_max).sum())
+
+        return reject(
+            f"Stage 4/5: no contract satisfies all gates simultaneously "
+            f"(of {n_dte} in {dte_min:.0f}-{dte_max:.0f} DTE window: "
+            f"{n_oi} pass OI>={min_open_interest:.0f}, {n_vol} pass volume>={min_volume:.0f}, "
+            f"{n_spread} pass spread<={max_spread_pct * 100:.0f}%, "
+            f"{n_iv} have a usable IV quote, {n_delta_computed} have a computed delta "
+            f"(delta requires iv — missing IV is the usual cause of missing delta), "
+            f"{n_delta_range} fall in delta range [{delta_min:.2f},{delta_max:.2f}])"
+        )
 
     # ------------------------------------------------------------------
     # Contract-level economic gates
@@ -1435,151 +1511,46 @@ def write_report(
     portfolio_stress: dict[str, Any] | None = None,
     batch_stats: dict[str, Any] | None = None,
 ) -> None:
+    """
+    Write the actionable report as CSV only.
+
+    A markdown version (with batch-health/portfolio-stress prose and a
+    "Detailed Candidate Templates" section) was previously also written
+    here; that has been removed by request — CSV is the sole report
+    artifact now. Portfolio-stress/regime info and batch health are still
+    computed and logged (see main.py), just no longer rendered to markdown.
+    """
     report_dir = Path(cfg.get("report_dir", "reports"))
     report_dir.mkdir(parents=True, exist_ok=True)
 
     ts = now_eastern_time.strftime("%Y%m%d_%H%M%S")
     csv_path = report_dir / f"actionable_report_{ts}.csv"
-    md_path = report_dir / f"actionable_report_{ts}.md"
 
     df = pd.DataFrame(results)
-
-    # CSV
     df.to_csv(csv_path, index=False)
 
-    # Markdown
-    lines: list[str] = []
-    lines.append("# Options Trading Plan v3.5 — Actionable Report")
-    lines.append("")
-    lines.append(f"Generated: {now_eastern_time.isoformat()}")
-    lines.append("")
-
-    if batch_stats:
-        lines.append("## Batch Health")
-        lines.append("")
-        lines.append(f"- Universe size: {batch_stats.get('universe_size')}")
-        lines.append(
-            f"- Symbols with a usable options chain: {batch_stats.get('symbols_with_options')} "
-            f"({batch_stats.get('completeness_pct', 0):.1f}%)"
-        )
-        if batch_stats.get("degraded"):
-            lines.append(
-                f"- ⚠️ **Degraded run**: completeness below configured "
-                f"min_batch_completeness_pct={batch_stats.get('min_batch_completeness_pct')}%. "
-                "This may indicate Yahoo Finance rate limiting or a partial outage — "
-                "treat this run's REJECT/DATA INCOMPLETE symbols with caution and "
-                "consider re-running before trusting the results."
-            )
-        lines.append("")
-
-    if portfolio_stress:
-        lines.append("## Portfolio-Level Check (Stages 11-14)")
-        lines.append("")
-        lines.append(
-            "This section is a manually-configured, illustrative check "
-            "(no free VIX/drawdown feed exists) — see plan.md Section 7 for scope."
-        )
-        lines.append("")
-        lines.append(f"- AUTHORIZED candidates today: {portfolio_stress.get('authorized_count')}")
-        lines.append(
-            f"- Illustrative beta-weighted delta exposure (1 contract each, shares-equivalent): "
-            f"{portfolio_stress.get('total_beta_weighted_delta_shares')}"
-        )
-        for label, loss in (portfolio_stress.get("stress_results") or {}).items():
-            lines.append(f"- Stress {label}: approx {loss} shares-equivalent P/L impact")
-        lines.append(f"- Hedge status: {portfolio_stress.get('hedge_status')}")
-        lines.append(f"- Current drawdown: {portfolio_stress.get('current_drawdown_pct')}%")
-        lines.append(f"- Current VIX: {portfolio_stress.get('current_vix')}")
-        lines.append(f"- Regime state: **{portfolio_stress.get('regime_state')}**")
-        for flag in portfolio_stress.get("regime_flags", []):
-            lines.append(f"  - ⚠️ {flag}")
-        lines.append("")
-
-    if df.empty:
-        lines.append("No results.")
-    else:
-        counts = df["decision_label"].value_counts()
-
-        lines.append("## Summary")
-        lines.append("")
-        for label, count in counts.items():
-            lines.append(f"- {label}: {count}")
-        lines.append("")
-
-        lines.append("## Results")
-        lines.append("")
-        lines.append(
-            "| Symbol | Decision | Strategy | Contract | Strike | Exp | DTE | Delta | IV Rank | VRP Ratio | Score | Reasons |"
-        )
-        lines.append("|---|---|---|---|---:|---|---:|---:|---:|---:|---:|---|")
-
-        for r in results:
-            reasons = r.get("reasons", [])
-            if isinstance(reasons, list):
-                reasons_text = "; ".join(str(x) for x in reasons)
-            else:
-                reasons_text = str(reasons)
-
-            reasons_text = reasons_text.replace("|", "/")
-
-            contract_id = r.get("contract_id") or ""
-            if len(contract_id) > 25:
-                contract_display = contract_id[:25] + "…"
-            else:
-                contract_display = contract_id
-
-            lines.append(
-                "| {symbol} | {decision} | {strategy} | {contract} | {strike} | {exp} | {dte} | {delta} | {iv_rank} | {vrp} | {score} | {reasons} |".format(
-                    symbol=r.get("symbol", ""),
-                    decision=r.get("decision_label", ""),
-                    strategy=r.get("strategy", ""),
-                    contract=contract_display,
-                    strike=r.get("strike", ""),
-                    exp=r.get("expiration", ""),
-                    dte=r.get("dte", ""),
-                    delta=r.get("delta", ""),
-                    iv_rank=r.get("iv_rank", ""),
-                    vrp=r.get("vrp_ratio", ""),
-                    score=r.get("score", ""),
-                    reasons=reasons_text,
-                )
-            )
-
-        lines.append("")
-        lines.append("## Detailed Candidate Templates")
-        lines.append("")
-
-        for r in results:
-            if r.get("decision_label") not in ("🟢 AUTHORIZED", "🟡 WAIT"):
-                continue
-
-            lines.append(f"### {r.get('symbol')} — {r.get('decision_label')}")
-            lines.append("")
-            lines.append(f"- Strategy: {r.get('strategy')}")
-            lines.append(f"- Contract: {r.get('contract_id')}")
-            lines.append(f"- Strike: {r.get('strike')}")
-            lines.append(f"- Expiration: {r.get('expiration')}")
-            lines.append(f"- DTE: {r.get('dte')}")
-            lines.append(f"- Delta: {r.get('delta')}")
-            lines.append(f"- IV: {r.get('iv')}")
-            lines.append(f"- IV Rank: {r.get('iv_rank')}")
-            lines.append(f"- VRP Ratio: {r.get('vrp_ratio')}")
-            lines.append(f"- OI: {r.get('open_interest')}")
-            lines.append(f"- Volume: {r.get('volume')}")
-            lines.append(f"- Spread %: {r.get('spread_pct')}")
-            lines.append(f"- Net Premium: {r.get('net_premium')}")
-            lines.append(f"- Premium / Cost Ratio: {r.get('premium_cost_ratio')}")
-            lines.append(f"- Score: {r.get('score')}")
-
-            reasons = r.get("reasons", [])
-            if isinstance(reasons, list) and reasons:
-                lines.append("- Notes:")
-                for reason in reasons:
-                    lines.append(f"  - {reason}")
-
-            lines.append("")
-
-    md_path.write_text("\n".join(lines), encoding="utf-8")
-
     log.info("Report written: %s", csv_path)
-    log.info("Report written: %s", md_path)
+
+
+def write_underlying_metrics_dump(cfg: dict[str, Any], conn: sqlite3.Connection) -> None:
+    """
+    Dump the full underlying_metrics table to
+    reports/temp_underlying_metrics_<ts>.csv — the Python equivalent of:
+
+        sqlite3 -csv -header options_info.db "select * from underlying_metrics;"
+
+    This is a raw table dump (every symbol collected this run, including
+    REJECT/DATA INCOMPLETE ones), independent of the Stage 0-7 gate logic
+    in evaluate_symbol/write_report, so it's useful for auditing exactly
+    what was fetched vs. what the gates did with it.
+    """
+    report_dir = Path(cfg.get("report_dir", "reports"))
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = now_eastern_time.strftime("%Y%m%d_%H%M%S")
+    out_path = report_dir / f"temp_underlying_metrics_{ts}.csv"
+
+    df = pd.read_sql_query("SELECT * FROM underlying_metrics", conn)
+    df.to_csv(out_path, index=False)
+
+    log.info("Underlying metrics dump written: %s (%d rows)", out_path, len(df))
