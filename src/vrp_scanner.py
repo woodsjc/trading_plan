@@ -17,6 +17,9 @@ try:
 except:
     session = None
 
+EARNINGS_WINDOW_DAYS = 21
+EXCLUDE_UNKNOWN_EARNINGS = False
+
 TIER1_STOCKS = [
     "AAPL",
     "MSFT",
@@ -103,7 +106,6 @@ TIER1_STOCKS = [
 ]
 TIER1_INDEX = ["SPY", "QQQ", "IWM", "DIA", "XLE", "XLF", "XLK", "GLD", "SLV", "TLT", "XLV", "RSP"]
 ALL_SYMBOLS = TIER1_STOCKS + TIER1_INDEX
-# ALL_SYMBOLS = TIER1_INDEX
 
 
 def bs_price(S, K, T, r, sigma, opt_type="call"):
@@ -128,6 +130,47 @@ def calc_iv(mkt_price, S, K, T, r=0.045, opt_type="call"):
         return brentq(lambda s: bs_price(S, K, T, r, s, opt_type) - mkt_price, 0.01, 5.0, maxiter=200)
     except:
         return np.nan
+
+
+def get_next_earnings_date(ticker):
+    """Return the next upcoming earnings date (datetime.date) or None if it can't be found."""
+    today = datetime.now(timezone.utc).date()
+    tk = yf.Ticker(ticker, session=session)
+    dates = []
+
+    # Source 1: calendar (fast, usually has the next confirmed/estimated date)
+    try:
+        cal = tk.calendar
+        raw = []
+        if isinstance(cal, dict):
+            raw = cal.get("Earnings Date") or []
+        elif isinstance(cal, pd.DataFrame) and "Earnings Date" in cal.index:
+            raw = cal.loc["Earnings Date"].dropna().tolist()
+        if not isinstance(raw, (list, tuple)):
+            raw = [raw]
+        for d in raw:
+            try:
+                dates.append(pd.Timestamp(d).date())
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Source 2: earnings-dates table (fallback if calendar gave nothing in the future)
+    if not any(d >= today for d in dates):
+        try:
+            ed = tk.get_earnings_dates(limit=8)
+            if ed is not None and not ed.empty:
+                for ts in ed.index:
+                    try:
+                        dates.append(pd.Timestamp(ts).date())
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    future = sorted(d for d in dates if d >= today)
+    return future[0] if future else None
 
 
 def get_hv_and_price(ticker):
@@ -303,10 +346,35 @@ def get_iv30_interp_and_nearest(ticker, last_price, contract_candidates):
 
 
 results = []
+excluded = []
+today_utc = datetime.now(timezone.utc).date()
+earnings_cutoff = today_utc + timedelta(days=EARNINGS_WINDOW_DAYS)
+
 print(
-    f"Scanning {len(ALL_SYMBOLS)} symbols for VRP + IV Rank (this takes ~2-3 sec per ticker for 1y option history)...\n"
+    f"Scanning {len(ALL_SYMBOLS)} symbols for VRP + IV Rank "
+    f"(skipping stocks with earnings on or before {earnings_cutoff}; ~2-3 sec per ticker)...\n"
 )
 for t in ALL_SYMBOLS:
+    # --- Earnings filter (stocks only; ETFs/indexes have no earnings) ---
+    next_earn = None
+    days_to_earn = np.nan
+    if t not in TIER1_INDEX:
+        next_earn = get_next_earnings_date(t)
+        if next_earn is not None:
+            days_to_earn = (next_earn - today_utc).days
+            if next_earn <= earnings_cutoff:
+                print(f"{t}: EARNINGS {next_earn} (in {days_to_earn}d) - SKIPPED")
+                excluded.append({"Ticker": t, "Next_Earnings": next_earn, "Days_To_Earnings": days_to_earn})
+                time.sleep(0.2)
+                continue
+        elif EXCLUDE_UNKNOWN_EARNINGS:
+            print(f"{t}: EARNINGS DATE UNKNOWN - SKIPPED")
+            excluded.append({"Ticker": t, "Next_Earnings": None, "Days_To_Earnings": np.nan})
+            time.sleep(0.2)
+            continue
+        else:
+            print(f"{t}: warning - earnings date unknown, keeping")
+
     hv10, hv20, hv30, price, hist_1y = get_hv_and_price(t)
     if np.isnan(price):
         print(f"{t}: NO PRICE")
@@ -332,6 +400,8 @@ for t in ALL_SYMBOLS:
             "Type": "ETF/INDEX" if t in TIER1_INDEX else "STOCK",
             "Price": round(price, 2),
             "Expiry": exps,
+            "Next_Earnings": next_earn if next_earn is not None else "",
+            "Days_To_Earnings": days_to_earn,
             "HV10": round(hv10, 2),
             "HV20": round(hv20, 2),
             "HV30": round(hv30, 2),
@@ -351,10 +421,14 @@ for t in ALL_SYMBOLS:
     )
     time.sleep(0.4)
 
+if excluded:
+    pd.DataFrame(excluded).to_csv("earnings_excluded.csv", index=False)
+    print(f"\nExcluded {len(excluded)} symbols for earnings -> earnings_excluded.csv")
+
 df = pd.DataFrame(results)
 if not df.empty:
     df_vrp = df[df["VRP_30"] > 1.2].sort_values("VRP_30", ascending=False)
-    print("\n=== VRP_30 > 1.2 (Schwab matched) ===")
+    print("\n=== VRP_30 > 1.2 (Schwab matched, no earnings in next " f"{EARNINGS_WINDOW_DAYS} days) ===")
     print(df_vrp.to_string(index=False))
 else:
     print("No data")
