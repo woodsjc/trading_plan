@@ -9,6 +9,7 @@ license-files = ["LICENSE"]
 
 dependencies = [
     "yfinance~=1.6.0",
+    "scipy~=1.18.1",
 ]
 
 [project.optional-dependencies]
