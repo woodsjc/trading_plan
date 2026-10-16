@@ -1,6 +1,7 @@
+import logging
 import time
 import warnings
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -10,11 +11,13 @@ from scipy.stats import norm
 
 warnings.filterwarnings("ignore")
 
+logger = logging.getLogger(__name__)
+
 try:
     from curl_cffi import requests as c_requests
 
     session = c_requests.Session(impersonate="chrome")
-except:
+except Exception:
     session = None
 
 EARNINGS_WINDOW_DAYS = 21
@@ -108,6 +111,11 @@ TIER1_INDEX = ["SPY", "QQQ", "IWM", "DIA", "XLE", "XLF", "XLK", "GLD", "SLV", "T
 ALL_SYMBOLS = TIER1_STOCKS + TIER1_INDEX
 
 
+def parse_date(s: str) -> date:
+    """Parse a YYYY-MM-DD string into a date (tz-aware parse, then dropped to a date)."""
+    return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=UTC).date()
+
+
 def bs_price(S, K, T, r, sigma, opt_type="call"):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0
@@ -128,13 +136,13 @@ def calc_iv(mkt_price, S, K, T, r=0.045, opt_type="call"):
         if mkt_price < intrinsic * 0.95:
             return np.nan
         return brentq(lambda s: bs_price(S, K, T, r, s, opt_type) - mkt_price, 0.01, 5.0, maxiter=200)
-    except:
+    except Exception:
         return np.nan
 
 
 def get_next_earnings_date(ticker):
     """Return the next upcoming earnings date (datetime.date) or None if it can't be found."""
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     tk = yf.Ticker(ticker, session=session)
     dates = []
 
@@ -151,10 +159,10 @@ def get_next_earnings_date(ticker):
         for d in raw:
             try:
                 dates.append(pd.Timestamp(d).date())
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as e:
+                logger.debug("%s: bad calendar earnings date %r: %s", ticker, d, e)
+    except Exception as e:
+        logger.debug("%s: calendar lookup failed: %s", ticker, e)
 
     # Source 2: earnings-dates table (fallback if calendar gave nothing in the future)
     if not any(d >= today for d in dates):
@@ -164,10 +172,10 @@ def get_next_earnings_date(ticker):
                 for ts in ed.index:
                     try:
                         dates.append(pd.Timestamp(ts).date())
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except Exception as e:
+                        logger.debug("%s: bad earnings-dates entry %r: %s", ticker, ts, e)
+        except Exception as e:
+            logger.debug("%s: get_earnings_dates failed: %s", ticker, e)
 
     future = sorted(d for d in dates if d >= today)
     return future[0] if future else None
@@ -185,7 +193,7 @@ def get_hv_and_price(ticker):
         hv30 = log_ret.tail(30).std() * np.sqrt(252) * 100
         last_price = float(close.iloc[-1])
         return float(hv10), float(hv20), float(hv30), last_price, hist
-    except Exception as e:
+    except Exception:
         return np.nan, np.nan, np.nan, np.nan, pd.DataFrame()
 
 
@@ -195,11 +203,11 @@ def get_atm_contract_info(ticker, last_price, hist_1y):
         exps = tk.options
         if not exps:
             return None
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(UTC).date()
         # find 25-50 DTE expiry for IV30
         candidates = []
         for exp in exps:
-            d = datetime.strptime(exp, "%Y-%m-%d").date()
+            d = parse_date(exp)
             days = (d - today).days
             if 20 <= days <= 55:
                 candidates.append((exp, days))
@@ -216,8 +224,8 @@ def get_atm_contract_info(ticker, last_price, hist_1y):
         # Build OCC symbol for history download: e.g. SPY260930C00770880 (strike*1000 padded 8)
         # yfinance expects format like "SPY260930C00770000" without dash
         # strike*1000 -> int
-        strike_int = int(round(strike * 1000))
-        exp_YYMMDD = datetime.strptime(exp_str, "%Y-%m-%d").strftime("%y%m%d")
+        strike_int = round(strike * 1000)
+        exp_YYMMDD = parse_date(exp_str).strftime("%y%m%d")
         # Handle tickers with 1-5 chars, OCC pads to 6
         occ = f"{ticker.upper():<6}{exp_YYMMDD}C{strike_int:08d}"
         occ = occ.replace(" ", "")
@@ -265,8 +273,8 @@ def get_iv_rank(ticker, current_iv, last_price, hist_1y, contract_info):
             return np.nan, np.nan, np.nan, np.nan, np.nan
 
         iv_series = []
-        today = datetime.now(timezone.utc).date()
-        exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+        today = datetime.now(UTC).date()
+        exp_date = parse_date(exp_str)
         for idx, row in merged.tail(252).iterrows():
             S = float(row["Underlying"])
             opt_price = float(row["OptClose"])
@@ -293,7 +301,7 @@ def get_iv_rank(ticker, current_iv, last_price, hist_1y, contract_info):
         iv_perc = float((iv_series < current_iv).sum() / len(iv_series) * 100)
 
         return float(np.clip(iv_rank, 0, 100)), iv_low, iv_high, iv_perc, len(iv_series)
-    except Exception as e:
+    except Exception:
         # print(f"IV Rank error {ticker}: {e}")
         return np.nan, np.nan, np.nan, np.nan, np.nan
 
@@ -301,7 +309,7 @@ def get_iv_rank(ticker, current_iv, last_price, hist_1y, contract_info):
 def get_iv30_interp_and_nearest(ticker, last_price, contract_candidates):
     try:
         tk = yf.Ticker(ticker, session=session)
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(UTC).date()
         # get two expiries bracketing 30
         lower = upper = None
         for exp, days in sorted(contract_candidates, key=lambda x: x[1]):
@@ -320,7 +328,7 @@ def get_iv30_interp_and_nearest(ticker, last_price, contract_candidates):
             c = calls.iloc[(abs(calls["strike"] - last_price)).argsort()[:1]].iloc[0]
             iv = c.get("impliedVolatility", np.nan)
             if pd.isna(iv) or iv < 0.01:
-                T = (datetime.strptime(exp, "%Y-%m-%d").date() - today).days / 365
+                T = (parse_date(exp) - today).days / 365
                 mid = (c["bid"] + c["ask"]) / 2 if c["bid"] > 0 else c["lastPrice"]
                 iv = calc_iv(mid, last_price, c["strike"], T, "call")
             return float(iv) if not pd.isna(iv) else np.nan
@@ -341,13 +349,13 @@ def get_iv30_interp_and_nearest(ticker, last_price, contract_candidates):
         iv30 = iv_low + w * (iv_up - iv_low)
         iv_nearest = iv_low if abs(lower[1] - 30) < abs(upper[1] - 30) else iv_up
         return float(iv30 * 100), float(iv_nearest * 100), f"{lower[1]:.0f}/{upper[1]:.0f}", f"{lower[0]}/{upper[0]}"
-    except:
+    except Exception:
         return np.nan, np.nan, "", ""
 
 
 results = []
 excluded = []
-today_utc = datetime.now(timezone.utc).date()
+today_utc = datetime.now(UTC).date()
 earnings_cutoff = today_utc + timedelta(days=EARNINGS_WINDOW_DAYS)
 
 print(
@@ -428,7 +436,7 @@ if excluded:
 df = pd.DataFrame(results)
 if not df.empty:
     df_vrp = df[df["VRP_30"] > 1.2].sort_values("VRP_30", ascending=False)
-    print("\n=== VRP_30 > 1.2 (Schwab matched, no earnings in next " f"{EARNINGS_WINDOW_DAYS} days) ===")
+    print(f"\n=== VRP_30 > 1.2 (Schwab matched, no earnings in next {EARNINGS_WINDOW_DAYS} days) ===")
     print(df_vrp.to_string(index=False))
 else:
     print("No data")
